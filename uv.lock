@@ -413,6 +413,7 @@ name = "pumpe"
 source = { editable = "." }
 dependencies = [
     { name = "aioitertools" },
+    { name = "anyio" },
     { name = "fast-depends" },
     { name = "fastapi", extra = ["standard"] },
     { name = "httpx", extra = ["http2"] },
@@ -435,6 +436,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aioitertools", specifier = ">=0.12.0" },
+    { name = "anyio", specifier = ">=4.9.0" },
     { name = "fast-depends", specifier = ">=2.4.12" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.116.1" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
