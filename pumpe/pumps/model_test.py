@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import Field, SQLModel
+from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from pumpe.models import BaseModel, PumpMeta, PumpMode
@@ -58,6 +58,17 @@ async def test_api_pump() -> None:
         assert full.created == 100
         assert full.updated == 0
         assert full.deleted == 0
+
+        query = select(CustomModel).order_by(CustomModel.source).limit(1)
+        record = (await session.exec(query)).first()
+        assert isinstance(record, CustomModel)
+        assert len(record.pump_hash__) == 64
+        assert full.started < record.pump_modified__ < full.started + timedelta(seconds=5)
+        assert record.pump_touched__
+        assert record.pump_extra__ == {"field3": "extra"}
+        assert record.source == "source_0"
+        assert record.field1 == 0
+        assert record.field2 is None
 
         skip = await pump.run()
         assert skip is None

@@ -6,7 +6,7 @@ from typing import Any, Self
 from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.alias_generators import to_snake
 from sqlalchemy.orm import declared_attr
-from sqlmodel import JSON, Column, DateTime, Field, SQLModel
+from sqlmodel import JSON, Column, Field, SQLModel
 
 
 class PumpMode(str, Enum):
@@ -20,19 +20,26 @@ class PumpMeta(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     pump: str
     mode: PumpMode
-    started: datetime = Field(sa_type=DateTime(timezone=True))
+    started: datetime
     skipped: int = 0
     created: int = 0
     updated: int = 0
     deleted: int = 0
     elapsed: float | None = None
 
+    @field_validator("*", mode="after")
+    @classmethod
+    def datetime_no_timezone(cls, value: Any) -> Any:
+        if not isinstance(value, datetime) or not datetime.tzinfo:
+            return value
+
+        return value.astimezone(UTC).replace(tzinfo=None)
+
 
 class BaseModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
     pump_modified__: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
-        sa_type=DateTime(timezone=True),
         sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
     )
     pump_touched__: bool = Field(default=True)
@@ -54,6 +61,14 @@ class BaseModel(SQLModel):
             return value
 
         return value.replace("\x00", "")
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def datetime_no_timezone(cls, value: Any) -> Any:
+        if not isinstance(value, datetime) or not datetime.tzinfo:
+            return value
+
+        return value.astimezone(UTC).replace(tzinfo=None)
 
     @model_validator(mode="after")
     def compute_pump_hash(self) -> Self:

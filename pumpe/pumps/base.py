@@ -66,7 +66,7 @@ class BasePump(ABC):
         return self.__class__.__name__
 
     async def _new_meta(self) -> PumpMeta | None:
-        started = datetime.now(tz=UTC)
+        started = datetime.now(UTC)
 
         last_full = await self._get_last(PumpMode.FULL)
         last_part = await self._get_last(PumpMode.PARTIAL)
@@ -85,7 +85,11 @@ class BasePump(ABC):
         if mode == PumpMode.FULL:
             query = query.where(PumpMeta.mode == mode)
 
-        return (await self.session.exec(query)).first()
+        last = (await self.session.exec(query)).first()
+        if last and not last.started.tzinfo:
+            last.started = last.started.replace(tzinfo=UTC)
+
+        return last
 
     async def _process_all(self, meta: PumpMeta) -> None:
         if meta.mode == PumpMode.FULL:
@@ -99,7 +103,7 @@ class BasePump(ABC):
         async for batch in abatched(generator, self.batch_size):
             await self._process_batch(batch, meta)
 
-        meta.elapsed = (datetime.now(tz=UTC) - meta.started).total_seconds()
+        meta.elapsed = (datetime.now(UTC) - meta.started).total_seconds()
 
     async def _process_batch(self, batch: tuple[dict[str, Any]], meta: PumpMeta) -> None:
         meta.skipped += len(batch)
@@ -107,3 +111,4 @@ class BasePump(ABC):
     async def _save_meta(self, meta: PumpMeta) -> None:
         self.session.add(meta)
         await self.session.commit()
+        await self.session.refresh(meta)
