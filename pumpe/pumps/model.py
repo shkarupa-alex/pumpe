@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from collections.abc import Iterable
 from functools import cached_property
 from operator import attrgetter
 from typing import Any
@@ -75,6 +76,12 @@ class ModelPump(BasePump):
             query_touch = update(self._model).values(pump_touched__=True).where(self._id(self._model).in_(unchanged))
             await self.session.exec(query_touch)
 
-        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self._model, items.values()))
-        await self.session.run_sync(lambda s: s.bulk_update_mappings(self._model, changed.values()))
+        await self._process_insert(items.values())
+        await self._process_update(changed.values())
         await self.session.commit()
+
+    async def _process_insert(self, items: Iterable[BaseModel]) -> None:
+        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self._model, items))
+
+    async def _process_update(self, items: Iterable[BaseModel]) -> None:
+        await self.session.run_sync(lambda s: s.bulk_update_mappings(self._model, items))
