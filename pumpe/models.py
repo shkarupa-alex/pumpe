@@ -39,8 +39,8 @@ class PumpMeta(SQLModel, table=True):
 class BaseModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
     pump_modified__: datetime = Field(
-        default_factory=lambda: datetime.now(UTC),
-        sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
+        default_factory=datetime.now,
+        sa_column_kwargs={"onupdate": datetime.now},
     )
     pump_touched__: bool = Field(default=True)
     pump_extra__: dict[str, Any] | None = Field(
