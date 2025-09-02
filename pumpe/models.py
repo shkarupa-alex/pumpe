@@ -21,7 +21,6 @@ class PumpMeta(SQLModel, table=True):
     pump: str
     mode: PumpMode
     started: datetime = Field(sa_type=DateTime(timezone=True))
-    # start_date: datetime = Field(sa_column=Column(DateTime(timezone=True)))
     skipped: int = 0
     created: int = 0
     updated: int = 0
