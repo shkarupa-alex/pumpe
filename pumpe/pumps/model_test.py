@@ -8,11 +8,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from pumpe.models import BaseModel, PumpMeta, PumpMode
+from pumpe.models import PumpMeta, PumpMode, PumpModel
 from pumpe.pumps.model import ModelPump
 
 
-class CustomModel(BaseModel, table=True):
+class CustomModel(PumpModel, table=True):
     source: str = Field(primary_key=True)
     field1: int
     field2: float | None = None
@@ -21,7 +21,7 @@ class CustomModel(BaseModel, table=True):
 class CustomModelPump(ModelPump):
     num_calls = 0
 
-    def model(self) -> type[BaseModel]:
+    def model(self) -> type[PumpModel]:
         return CustomModel
 
     async def _fetch(

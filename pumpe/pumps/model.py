@@ -6,17 +6,17 @@ from typing import Any
 
 from sqlmodel import delete, select, update
 
-from pumpe.models import BaseModel, PumpMeta, PumpMode
+from pumpe.models import PumpMeta, PumpMode, PumpModel
 from pumpe.pumps.base import BasePump
 
 
 class ModelPump(BasePump):
     @abstractmethod
-    def model(self) -> type[BaseModel]:
+    def model(self) -> type[PumpModel]:
         pass
 
     @cached_property
-    def _model(self) -> type[BaseModel]:
+    def _model(self) -> type[PumpModel]:
         model = self.model()
         if not getattr(model, "model_config", {}).get("table", False):
             raise ValueError("Model should have a table backend")
@@ -80,8 +80,8 @@ class ModelPump(BasePump):
         await self._process_update(changed.values())
         await self.session.commit()
 
-    async def _process_insert(self, items: Iterable[BaseModel]) -> None:
+    async def _process_insert(self, items: Iterable[PumpModel]) -> None:
         await self.session.run_sync(lambda s: s.bulk_insert_mappings(self._model, items))
 
-    async def _process_update(self, items: Iterable[BaseModel]) -> None:
+    async def _process_update(self, items: Iterable[PumpModel]) -> None:
         await self.session.run_sync(lambda s: s.bulk_update_mappings(self._model, items))
