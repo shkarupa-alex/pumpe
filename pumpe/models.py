@@ -36,7 +36,7 @@ class PumpMeta(SQLModel, table=True):
         return value.astimezone(UTC).replace(tzinfo=None)
 
 
-class BaseModel(SQLModel):
+class PumpModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
     pump_modified__: datetime = Field(
         default_factory=datetime.now,
