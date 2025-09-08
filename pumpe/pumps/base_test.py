@@ -22,6 +22,8 @@ class CustomTaskPump(BasePump):
         modified_since: datetime | None,
         created_after: datetime | None,
     ) -> AsyncGenerator[dict[str, Any]]:
+        assert isinstance(modified_since, datetime) or modified_since is None
+        assert isinstance(created_after, datetime) or created_after is None
         for _ in range(100 // (2 if modified_since else 1)):
             yield {"success": True}
 
