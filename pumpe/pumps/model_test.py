@@ -29,6 +29,9 @@ class CustomModelPump(ModelPump):
         modified_since: datetime | None,
         created_after: datetime | None,
     ) -> AsyncGenerator[dict[str, Any]]:
+        assert isinstance(modified_since, datetime) or modified_since is None
+        assert isinstance(created_after, datetime) or created_after is None
+
         if self.num_calls < 2:
             self.num_calls += 1
 

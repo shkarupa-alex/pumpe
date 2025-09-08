@@ -92,8 +92,8 @@ class BasePump(ABC):
             modified_since = None
             created_after = None
         else:
-            modified_since = await self._get_last(PumpMode.PARTIAL)
-            created_after = modified_since.started - self.past_interval
+            modified_since = (await self._get_last(PumpMode.PARTIAL)).started
+            created_after = modified_since - self.past_interval
 
         generator = self._fetch(modified_since=modified_since, created_after=created_after)
         async for batch in abatched(generator, self.batch_size):
