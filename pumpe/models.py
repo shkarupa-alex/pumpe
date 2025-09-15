@@ -1,5 +1,5 @@
 import hashlib
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from typing import Any, Self
 
@@ -27,14 +27,6 @@ class PumpMeta(SQLModel, table=True):
     deleted: int = 0
     elapsed: float | None = None
 
-    @field_validator("*", mode="after")
-    @classmethod
-    def datetime_no_timezone(cls, value: Any) -> Any:
-        if not isinstance(value, datetime) or not datetime.tzinfo:
-            return value
-
-        return value.astimezone(UTC).replace(tzinfo=None)
-
 
 class PumpModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
@@ -61,14 +53,6 @@ class PumpModel(SQLModel):
             return value
 
         return value.replace("\x00", "")
-
-    @field_validator("*", mode="after")
-    @classmethod
-    def datetime_no_timezone(cls, value: Any) -> Any:
-        if not isinstance(value, datetime) or not datetime.tzinfo:
-            return value
-
-        return value.astimezone(UTC).replace(tzinfo=None)
 
     @model_validator(mode="after")
     def compute_pump_hash(self) -> Self:
