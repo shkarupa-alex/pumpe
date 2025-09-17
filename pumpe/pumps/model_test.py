@@ -18,6 +18,11 @@ class CustomModel(PumpModel, table=True):
     field2: float | None = None
 
 
+class AnotherModel(PumpModel, table=True):
+    # This model used to test correct inheritance
+    id: int = Field(primary_key=True)
+
+
 class CustomModelPump(ModelPump):
     num_calls = 0
 
