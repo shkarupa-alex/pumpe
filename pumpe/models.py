@@ -6,7 +6,7 @@ from typing import Any, Self
 from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.alias_generators import to_snake
 from sqlalchemy.orm import declared_attr
-from sqlmodel import JSON, Column, Field, SQLModel
+from sqlmodel import JSON, Field, SQLModel
 
 
 class PumpMode(str, Enum):
@@ -37,7 +37,7 @@ class PumpModel(SQLModel):
     pump_touched__: bool = Field(default=True)
     pump_extra__: dict[str, Any] | None = Field(
         default=None,
-        sa_column=Column(JSON(none_as_null=True)),
+        sa_type=JSON(none_as_null=True),
     )
 
     model_config = ConfigDict(from_attributes=True, extra="allow")
