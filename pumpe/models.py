@@ -18,7 +18,7 @@ class PumpMeta(SQLModel, table=True):
     __tablename__ = "pump_meta"
 
     id: int | None = Field(default=None, primary_key=True)
-    pump: str
+    pump: str = Field(index=True)
     mode: PumpMode
     started: datetime
     skipped: int = 0
