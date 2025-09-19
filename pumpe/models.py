@@ -1,5 +1,5 @@
 import hashlib
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Self
 
@@ -53,6 +53,14 @@ class PumpModel(SQLModel):
             return value
 
         return value.replace("\x00", "")
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def datetime_clear_timezone(cls, value: Any) -> Any:
+        if not isinstance(value, datetime) or not datetime.tzinfo:
+            return value
+
+        return value.astimezone(UTC).replace(tzinfo=None)
 
     @model_validator(mode="after")
     def compute_pump_hash(self) -> Self:
