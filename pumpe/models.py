@@ -72,8 +72,11 @@ class PumpModel(SQLModel):
 
     @model_validator(mode="after")
     def compute_pump_extra(self) -> Self:
+        extra = None
         if self.model_config.get("extra", False) and self.__pydantic_extra__:
-            self.__dict__["pump_extra__"] = self.__pydantic_extra__
+            extra = self.__pydantic_extra__
+
+        self.__dict__["pump_extra__"] = extra
 
         return self
 
