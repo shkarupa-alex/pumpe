@@ -1,4 +1,3 @@
-from abc import abstractmethod
 from collections.abc import Iterable
 from functools import cached_property
 from operator import attrgetter
@@ -11,25 +10,26 @@ from pumpe.pumps.base import BasePump
 
 
 class ModelPump(BasePump):
-    @abstractmethod
-    def model(self) -> type[PumpModel]:
-        pass
+    _model: type[PumpModel] | None = None
 
     @cached_property
-    def _model(self) -> type[PumpModel]:
-        model = self.model()
-        if not getattr(model, "model_config", {}).get("table", False):
+    def model(self) -> type[PumpModel]:
+        if self._model is None:
+            raise ValueError("Model should be set via `_model` property")
+        if not issubclass(self._model, PumpModel):
+            raise ValueError("Model should be a subclass of `PumpModel`")
+        if not getattr(self._model, "model_config", {}).get("table", False):
             raise ValueError("Model should have a table backend")
 
-        return model
+        return self._model
 
     @property
     def title(self) -> str:
-        return self._model.__name__
+        return self.model.__name__
 
     @cached_property
-    def _id(self) -> attrgetter:
-        return attrgetter(self._model.get_primary_key())
+    def id(self) -> attrgetter:
+        return attrgetter(self.model.get_primary_key())
 
     async def _process_all(self, meta: PumpMeta) -> PumpMeta:
         await self._untouch_all(meta)
@@ -42,7 +42,7 @@ class ModelPump(BasePump):
         if meta.mode == PumpMode.PARTIAL:
             return
 
-        query = update(self._model).values(pump_touched__=False)
+        query = update(self.model).values(pump_touched__=False)
         await self.session.exec(query)
         await self.session.commit()
 
@@ -50,30 +50,30 @@ class ModelPump(BasePump):
         if meta.mode == PumpMode.PARTIAL:
             return 0
 
-        query = delete(self._model).where(self._model.pump_touched__.is_(False))
+        query = delete(self.model).where(self.model.pump_touched__.is_(False))
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
         return deleted
 
     async def _process_batch(self, batch: tuple[dict[str, Any]], meta: PumpMeta) -> None:
-        items = map(self._model.model_validate, batch)
-        items = {self._id(i): i for i in items}
+        items = map(self.model.model_validate, batch)
+        items = {self.id(i): i for i in items}
 
-        query_exist = select(self._model).where(self._id(self._model).in_(items))
+        query_exist = select(self.model).where(self.id(self.model).in_(items))
         existing = (await self.session.exec(query_exist)).all()
 
         unchanged = {
-            self._id(e): items.pop(self._id(e)) for e in existing if items[self._id(e)].pump_hash__ == e.pump_hash__
+            self.id(e): items.pop(self.id(e)) for e in existing if items[self.id(e)].pump_hash__ == e.pump_hash__
         }
-        changed = {self._id(e): items.pop(self._id(e)) for e in existing if self._id(e) not in unchanged}
+        changed = {self.id(e): items.pop(self.id(e)) for e in existing if self.id(e) not in unchanged}
 
         meta.skipped += len(unchanged)
         meta.created += len(items)
         meta.updated += len(changed)
 
         if meta.mode == PumpMode.FULL:
-            query_touch = update(self._model).values(pump_touched__=True).where(self._id(self._model).in_(unchanged))
+            query_touch = update(self.model).values(pump_touched__=True).where(self.id(self.model).in_(unchanged))
             await self.session.exec(query_touch)
 
         await self._process_insert(items.values())
@@ -81,7 +81,7 @@ class ModelPump(BasePump):
         await self.session.commit()
 
     async def _process_insert(self, items: Iterable[PumpModel]) -> None:
-        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self._model, items))
+        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, items))
 
     async def _process_update(self, items: Iterable[PumpModel]) -> None:
-        await self.session.run_sync(lambda s: s.bulk_update_mappings(self._model, items))
+        await self.session.run_sync(lambda s: s.bulk_update_mappings(self.model, items))

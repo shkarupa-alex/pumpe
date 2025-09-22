@@ -26,8 +26,7 @@ class AnotherModel(PumpModel, table=True):
 class CustomModelPump(ModelPump):
     num_calls = 0
 
-    def model(self) -> type[PumpModel]:
-        return CustomModel
+    _model: type[PumpModel] = CustomModel
 
     async def _fetch(
         self,
