@@ -1,4 +1,3 @@
-from abc import abstractmethod
 from collections.abc import Iterable
 from functools import cached_property
 from operator import attrgetter
@@ -11,13 +10,12 @@ from pumpe.pumps.base import BasePump
 
 
 class ModelPump(BasePump):
-    @property
-    @abstractmethod
-    def _model(self) -> type[PumpModel]:
-        pass
+    _model: type[PumpModel] | None = None
 
     @cached_property
     def model(self) -> type[PumpModel]:
+        if self._model is None:
+            raise ValueError("Model should be set via `_model` property")
         if not issubclass(self._model, PumpModel):
             raise ValueError("Model should be a subclass of `PumpModel`")
         if not getattr(self._model, "model_config", {}).get("table", False):
