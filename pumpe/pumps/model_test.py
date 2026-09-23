@@ -869,7 +869,13 @@ class WritingHoldPump(ScriptedRecordPump):
 
 
 @pytest.mark.asyncio
-async def test_competing_run_skips_while_holder_is_writing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("expired", [False, True])
+async def test_competing_run_skips_while_holder_is_writing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    expired: bool,
+) -> None:
     async with file_sessions(tmp_path, busy_timeout=1) as (session_a, session_b):
         await seed_records(session_a, ROW_2)
         await session_a.commit()
@@ -877,20 +883,29 @@ async def test_competing_run_skips_while_holder_is_writing(tmp_path: Path, caplo
         holder = WritingHoldPump(session_a, timedelta(0), timedelta(0), timedelta(0), batch_size=1)
         holder.script = (ROW_1,)
         holder.gate = Gate()
+        if expired:
+            # The committed expiry passes while the holder's renewal waits uncommitted in its write transaction.
+            holder.lease_timeout = timedelta(seconds=0.05)
         results: list[PumpMeta | BaseException | None] = []
         async with anyio.create_task_group() as tg:
             tg.start_soon(pump_in_background, holder, results)
             await holder.gate.reached.wait()
+            if expired:
+                await anyio.sleep(0.1)
 
             started = anyio.current_time()
             try:
                 assert await scripted_pump(session_b, ROW_1).run() is None
             finally:
                 holder.gate.opened.set()
-            # Well below the one-second busy timeout: the competitor never waited on the holder's lock.
-            assert anyio.current_time() - started < 0.5
+            if not expired:
+                # Well below the one-second busy timeout: a live lease is skipped without waiting on its lock.
+                assert anyio.current_time() - started < 0.5
 
         assert isinstance(results[0], PumpMeta)
         assert results[0].created == 1
         assert await lease_owner(session_a) is None
         assert "Could not release the lease" not in caplog.text
+
+        # The competitor's session is left usable, and the released lease can be taken again.
+        assert await scripted_pump(session_b, ROW_1).run() is not None

@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import anyio
 from aioitertools.itertools import batched as abatched
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlmodel import col, or_, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -153,7 +153,16 @@ class BasePump(ABC):
             .values(owner=owner, expires=now + self.lease_timeout)
         )
 
-        taken = (await self.session.exec(takeover)).rowcount == 1
+        try:
+            taken = (await self.session.exec(takeover)).rowcount == 1
+        except OperationalError as e:
+            if e.connection_invalidated:
+                raise
+            # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
+            # and the engine gave up waiting on its lock (SQLite busy timeout, InnoDB lock wait timeout): it is held.
+            await self.session.rollback()
+            self._lease = None
+            return False
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
         # A takeover that failed to execute wrote nothing, so there is no new token to release.
         self._lease = owner

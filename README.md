@@ -18,7 +18,9 @@ One run of a pump writes at a time, across sessions and processes: a run takes a
 and `run()` returns `None` while another run holds it.
 Every write transaction renews the lease, and a run that loses it fails before writing anything more.
 A lease older than `lease_timeout` (a class attribute, 10 minutes by default) is taken over, so keep it above
-the longest pause between two batches of `_fetch`.
+the longest time a run spends between two renewals: waiting for the next batch of `_fetch` plus writing a batch.
+A competing run that finds the lease expired while its holder is still writing waits for the database's lock
+timeout, then skips.
 
 ## Running
 
