@@ -1,19 +1,28 @@
 from asyncio import sleep
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import anyio
 import pytest
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import event
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from pumpe.models import PumpMeta, PumpMode
+from pumpe.models import PumpLock, PumpMeta, PumpMode
 from pumpe.pumps.base import BasePump, lock_contended
-from pumpe.pumps.model_test import Gate, file_sessions
+from pumpe.pumps.model_test import (
+    ROW_1,
+    Gate,
+    RecordModel,
+    file_sessions,
+    lease_owner,
+    memory_session,
+    scripted_pump,
+)
 
 
 class CustomTaskPump(BasePump):
@@ -217,20 +226,89 @@ class DriverError(Exception):
             setattr(self, name, value)
 
 
-@pytest.mark.parametrize(
-    ("orig", "contended"),
-    [
-        (DriverError("database is locked", sqlite_errorcode=5), True),
-        (DriverError("database table is locked", sqlite_errorcode=262), True),
-        (DriverError("disk I/O error", sqlite_errorcode=10), False),
-        (DriverError("could not obtain lock", sqlstate="55P03"), True),
-        (DriverError("deadlock detected", pgcode="40P01"), True),
-        (DriverError("terminating connection", sqlstate="57P01"), False),
-        (DriverError(1205, "Lock wait timeout exceeded"), True),
-        (DriverError(1213, "Deadlock found"), True),
-        (DriverError(2013, "Lost connection"), False),
-        (DriverError("injected failure"), False),
-    ],
-)
-def test_lock_contended(orig: Exception, *, contended: bool) -> None:
-    assert lock_contended(OperationalError("UPDATE pump_lock", None, orig)) is contended
+# Shaped like each driver's errors: MySQL drivers also set a generic sqlstate, asyncpg's reach SQLAlchemy as DBAPIError.
+LOCK_ERRORS = [
+    pytest.param(OperationalError, DriverError("database is locked", sqlite_errorcode=5), id="sqlite-busy"),
+    pytest.param(OperationalError, DriverError("database table is locked", sqlite_errorcode=262), id="sqlite-locked"),
+    pytest.param(OperationalError, DriverError(1205, "Lock wait timeout exceeded", sqlstate="HY000"), id="mysql-wait"),
+    pytest.param(OperationalError, DriverError(1213, "Deadlock found", sqlstate="40001"), id="mysql-deadlock"),
+    pytest.param(OperationalError, DriverError(1205, "Lock wait timeout exceeded"), id="mysqlclient-wait"),
+    pytest.param(DBAPIError, DriverError("could not obtain lock", sqlstate="55P03"), id="asyncpg-wait"),
+    pytest.param(OperationalError, DriverError("could not obtain lock", sqlstate="55P03"), id="psycopg-wait"),
+    pytest.param(OperationalError, DriverError("deadlock detected", pgcode="40P01"), id="psycopg2-deadlock"),
+]
+OTHER_ERRORS = [
+    pytest.param(OperationalError, DriverError("disk I/O error", sqlite_errorcode=10), id="sqlite-io"),
+    pytest.param(OperationalError, DriverError(2013, "Lost connection", sqlstate="HY000"), id="mysql-lost"),
+    pytest.param(DBAPIError, DriverError("terminating connection", sqlstate="57P01"), id="asyncpg-terminated"),
+    pytest.param(OperationalError, DriverError("injected failure"), id="no-code"),
+]
+
+
+@pytest.mark.parametrize(("error", "orig"), LOCK_ERRORS)
+def test_lock_contended(error: type[DBAPIError], orig: Exception) -> None:
+    assert lock_contended(error("UPDATE pump_lock", None, orig))
+
+
+@pytest.mark.parametrize(("error", "orig"), OTHER_ERRORS)
+def test_lock_not_contended(error: type[DBAPIError], orig: Exception) -> None:
+    assert not lock_contended(error("UPDATE pump_lock", None, orig))
+
+
+def fail_takeover(session: AsyncSession, error: DBAPIError) -> None:
+    """Fail the next lease takeover once with the given error."""
+    pending = [error]
+
+    def hook(  # noqa: PLR0913, PLR0917
+        conn: object,  # noqa: ARG001
+        cursor: object,  # noqa: ARG001
+        statement: str,
+        parameters: object,
+        context: object,  # noqa: ARG001
+        executemany: bool,  # noqa: ARG001, FBT001
+    ) -> None:
+        taking = isinstance(parameters, tuple) and parameters[:1] != (None,)
+        if pending and taking and statement.startswith("UPDATE pump_lock SET owner=?, expires=? WHERE"):
+            raise pending.pop()
+
+    assert session.bind is not None
+    event.listen(session.bind.sync_engine, "before_cursor_execute", hook)
+
+
+async def expired_foreign_lease(session: AsyncSession) -> None:
+    session.add(PumpLock(pump=RecordModel.__name__, owner="other", expires=datetime.now(UTC) - timedelta(hours=1)))
+    await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "orig"), LOCK_ERRORS)
+async def test_contended_takeover_skips(
+    error: type[DBAPIError],
+    orig: Exception,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with memory_session() as session:
+        await expired_foreign_lease(session)
+        fail_takeover(session, error("UPDATE pump_lock", None, orig))
+        pump = scripted_pump(session, ROW_1)
+
+        assert await pump.run() is None
+        assert not session.in_transaction()
+        assert "the expired lease is still locked by its holder" in caplog.text
+        assert "Could not release the lease" not in caplog.text
+
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.created == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "orig"), OTHER_ERRORS)
+async def test_failed_takeover_raises(error: type[DBAPIError], orig: Exception) -> None:
+    async with memory_session() as session:
+        await expired_foreign_lease(session)
+        fail_takeover(session, error("UPDATE pump_lock", None, orig))
+
+        with pytest.raises(error):
+            await scripted_pump(session, ROW_1).run()
+        assert await lease_owner(session) == "other"

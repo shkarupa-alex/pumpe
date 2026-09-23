@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import anyio
 from aioitertools.itertools import batched as abatched
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlmodel import col, or_, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -20,17 +20,18 @@ POSTGRESQL_LOCK_STATES = frozenset({"55P03", "40P01"})  # lock_not_available, de
 MYSQL_LOCK_ERRORS = frozenset({1205, 1213})  # ER_LOCK_WAIT_TIMEOUT, ER_LOCK_DEADLOCK
 
 
-def lock_contended(error: OperationalError) -> bool:
+def lock_contended(error: DBAPIError) -> bool:
     """Tell a statement that failed waiting on another transaction's lock from a genuine database error."""
     orig = error.orig
     sqlite_code = getattr(orig, "sqlite_errorcode", None)
     if isinstance(sqlite_code, int):
         return sqlite_code & 0xFF in SQLITE_LOCK_CODES
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
-    if isinstance(sqlstate, str):
-        return sqlstate in POSTGRESQL_LOCK_STATES
+    # MySQL drivers put the error number first, and also set a generic sqlstate such as HY000, so it goes before it.
     args: tuple[object, ...] = getattr(orig, "args", ())
-    return bool(args) and args[0] in MYSQL_LOCK_ERRORS
+    if args and isinstance(args[0], int):
+        return args[0] in MYSQL_LOCK_ERRORS
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return sqlstate in POSTGRESQL_LOCK_STATES
 
 
 class BasePump(ABC):
@@ -174,7 +175,7 @@ class BasePump(ABC):
 
         try:
             taken = (await self.session.exec(takeover)).rowcount == 1
-        except OperationalError as e:
+        except DBAPIError as e:
             # Only another run's token is evidence that the lock belongs to its holder: SQLite locks the whole
             # database, so a free or own lease can also be blocked by unrelated writes, which must not look like a skip.
             if not lock_contended(e) or holder is None or holder in self._unreleased:
@@ -182,6 +183,8 @@ class BasePump(ABC):
             # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
             # and the engine gave up waiting on its lock (SQLite busy timeout, InnoDB lock wait timeout): it is held.
             await self.session.rollback()
+            # Only a holder that overran lease_timeout gets here; a warning keeps a stuck one visible.
+            self.logger.warning("Skip pumping, the expired lease is still locked by its holder: %s", self.title)
             self._lease = None
             return False
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
