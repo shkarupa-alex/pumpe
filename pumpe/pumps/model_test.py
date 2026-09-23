@@ -10,7 +10,7 @@ from typing import Any
 import anyio
 import pytest
 from sqlalchemy import event
-from sqlalchemy.exc import StatementError
+from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -455,3 +455,102 @@ async def test_cancel_during_final_commit_does_not_orphan_lease(tmp_path: Path) 
         after = await scripted_pump(session_b, ROW_1).run()
         assert after is not None
         assert after.mode == PumpMode.FULL
+
+
+def fail_once(session: AsyncSession, prefix: str) -> None:
+    failed: list[str] = []
+
+    def hook(  # noqa: PLR0913, PLR0917
+        conn: object,  # noqa: ARG001
+        cursor: object,  # noqa: ARG001
+        statement: str,
+        parameters: object,  # noqa: ARG001
+        context: object,  # noqa: ARG001
+        executemany: bool,  # noqa: ARG001, FBT001
+    ) -> None:
+        if not failed and statement.startswith(prefix):
+            failed.append(statement)
+            raise OperationalError(statement, None, Exception("injected failure"))
+
+    assert session.bind is not None
+    event.listen(session.bind.sync_engine, "before_cursor_execute", hook)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_fails", [False, True])
+async def test_failed_release_keeps_pump_usable(*, source_fails: bool) -> None:
+    async with memory_session() as session:
+        fail_once(session, "UPDATE pump_lock SET owner=?, expires=? WHERE")
+
+        first = scripted_pump(session, ValueError("source") if source_fails else ROW_1)
+        with pytest.raises(ValueError if source_fails else OperationalError):
+            await first.run()
+        assert not session.in_transaction()
+
+        # The next run of the same pump takes its unreleased lease back instead of waiting for it to expire.
+        first.script = (ROW_1,)
+        meta = await first.run()
+        assert meta is not None
+        assert meta.mode == PumpMode.FULL
+        assert (meta.created, meta.skipped) == ((1, 0) if source_fails else (0, 1))
+        assert await lease_owner(session) is None
+
+
+@pytest.mark.asyncio
+async def test_lease_row_is_created_outside_the_takeover_transaction() -> None:
+    async with memory_session() as session:
+        log: list[str] = []
+        assert session.bind is not None
+        sync_engine = session.bind.sync_engine
+
+        def statement(  # noqa: PLR0913, PLR0917
+            conn: object,  # noqa: ARG001
+            cursor: object,  # noqa: ARG001
+            statement: str,
+            parameters: object,  # noqa: ARG001
+            context: object,  # noqa: ARG001
+            executemany: bool,  # noqa: ARG001, FBT001
+        ) -> None:
+            log.append(re.split(r" \(| SET | WHERE ", statement, maxsplit=1)[0])
+
+        event.listen(sync_engine, "before_cursor_execute", statement)
+        event.listen(sync_engine, "commit", lambda _: log.append("COMMIT"))
+        event.listen(sync_engine, "rollback", lambda _: log.append("ROLLBACK"))
+
+        meta = await scripted_pump(session, ROW_1).run()
+        assert meta is not None
+
+        transactions: list[list[str]] = [[]]
+        for entry in log:
+            if entry in {"COMMIT", "ROLLBACK"}:
+                transactions.append([])
+            else:
+                transactions[-1].append(entry)
+        [creating] = [t for t in transactions if "INSERT INTO pump_lock" in t]
+        assert "UPDATE pump_lock" not in creating
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_runs_one_wins(tmp_path: Path) -> None:
+    async with file_sessions(tmp_path) as (session_a, session_b):
+        gates = Gate(), Gate()
+        first_done = anyio.Event()
+        results: list[PumpMeta | BaseException | None] = []
+
+        async def pump(session: AsyncSession, gate: Gate) -> None:
+            await pump_in_background(scripted_pump(session, gate, ROW_1), results)
+            first_done.set()
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump, session_a, gates[0])
+            tg.start_soon(pump, session_b, gates[1])
+
+            # The loser returns while the winner still holds the lease at its gate.
+            with anyio.fail_after(5):
+                await first_done.wait()
+            assert results == [None]
+            assert sum(g.reached.is_set() for g in gates) == 1
+            for gate in gates:
+                gate.opened.set()
+
+        assert sorted(type(r).__name__ for r in results) == ["NoneType", "PumpMeta"]

@@ -3,7 +3,7 @@
 Allows fetching external data via API and store it in database.
 Supports full and partial modes.
 
-See `pumpe/pumps/model_test.py` for example.
+See [`pumpe/pumps/model_test.py`](https://github.com/shkarupa-alex/pumpe/blob/master/pumpe/pumps/model_test.py) for example.
 
 ## Datetimes
 

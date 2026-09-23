@@ -83,3 +83,15 @@ def test_runtime_requires_sqlalchemy_asyncio() -> None:
     locked = [d for d in pumpe["dependencies"] if d["name"] == "sqlalchemy"]
     assert locked
     assert all("asyncio" in d.get("extra", []) for d in locked)
+
+
+def test_readme_example_is_reachable() -> None:
+    # README.md is the PyPI long description, and test modules are not shipped: point at the repository.
+    repository = "https://github.com/shkarupa-alex/pumpe"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    assert project["urls"]["Repository"] == repository
+
+    readme = (ROOT / "README.md").read_text()
+    references = re.findall(r"\S*_test\.py\S*", readme)
+    assert references
+    assert all(f"({repository}/blob/" in reference for reference in references), references

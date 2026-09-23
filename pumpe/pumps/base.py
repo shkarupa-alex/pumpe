@@ -54,7 +54,8 @@ class BasePump(ABC):
                 try:
                     await self._release_lease()
                 except Exception:
-                    # Never mask the run's own failure: an unreleased lease just expires.
+                    # Never mask the run's own failure; the next run takes the unreleased lease back by its token.
+                    await self.session.rollback()
                     self.logger.warning("Could not release the lease: %s", self.title, exc_info=True)
             raise
 
@@ -100,34 +101,46 @@ class BasePump(ABC):
     async def _acquire_lease(self) -> bool:
         # Overlapping runs of one pump cannot be ordered safely (an older run could write after a newer one),
         # so runs are serialized; an expired lease is taken over, as its holder is presumed dead.
+        await self._ensure_lease_row()
+
         owner = uuid4().hex
         now = datetime.now(UTC)
+        free = or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now)
+        if self._lease is not None:
+            # This instance's own lease, left behind by a release that failed.
+            free = or_(free, col(PumpLock.owner) == self._lease)
         takeover = (
             update(PumpLock)
-            .where(
-                col(PumpLock.pump) == self.title,
-                or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now),
-            )
+            .where(col(PumpLock.pump) == self.title, free)
             .values(owner=owner, expires=now + self.lease_timeout, generation=col(PumpLock.generation) + 1)
         )
+
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
         self._lease = owner
-        if (await self.session.exec(takeover)).rowcount == 1:
-            query = select(PumpLock.generation).where(PumpLock.pump == self.title)
-            self._generation = (await self.session.exec(query)).one()
-            await self.session.commit()
-            return True
-
-        self._generation = 1
-        self.session.add(PumpLock(pump=self.title, owner=owner, expires=now + self.lease_timeout, generation=1))
-        try:
-            await self.session.commit()
-        except IntegrityError:
+        if (await self.session.exec(takeover)).rowcount != 1:
             self._lease = None
             await self.session.rollback()
             return False
 
+        query = select(PumpLock.generation).where(PumpLock.pump == self.title)
+        self._generation = (await self.session.exec(query)).one()
+        await self.session.commit()
         return True
+
+    async def _ensure_lease_row(self) -> None:
+        query = select(PumpLock.pump).where(PumpLock.pump == self.title)
+        exists = (await self.session.exec(query)).first() is not None
+        await self.session.commit()
+        if exists:
+            return
+
+        # Created on its own: in the takeover's transaction, InnoDB's gap lock on the missing key would
+        # deadlock two first runs of the same pump against each other.
+        self.session.add(PumpLock(pump=self.title))
+        try:
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
 
     async def _renew_lease(self) -> None:
         """Fence the current transaction: call it before the first write of every transaction a run commits."""
