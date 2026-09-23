@@ -12,7 +12,7 @@ from uuid import UUID
 
 import anyio
 import pytest
-from sqlalchemy import Column, Integer, String, event, text
+from sqlalchemy import Column, Integer, String, event, inspect, text
 from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, delete, select
@@ -1054,3 +1054,30 @@ async def test_collating_keys_in_one_batch_hit_the_unique_constraint() -> None:
         with pytest.raises(IntegrityError):
             await pump.run()
         assert (await session.exec(select(NocaseModel.code, NocaseModel.value))).all() == [("abc", 1)]
+
+
+@pytest.mark.asyncio
+async def test_full_run_keeps_retained_identity_of_surviving_row() -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = ({"id": 1, "value": 1}, {"id": 2, "value": 1})
+        assert await pump.run() is not None
+
+        kept = (await session.exec(select(RecordModel).where(RecordModel.id == 1))).one()
+        gone = (await session.exec(select(RecordModel).where(RecordModel.id == 2))).one()
+
+        pump.records = ({"id": 1, "value": 2},)
+        meta = await pump.run()
+        assert meta is not None
+        assert (meta.updated, meta.deleted) == (1, 1)
+
+        assert inspect(kept, raiseerr=True).persistent
+        assert kept in session
+        assert not inspect(gone, raiseerr=True).persistent
+        await session.refresh(kept)
+        assert kept.value == 2
+
+        kept.value = 3
+        await session.commit()
+        session.expunge_all()
+        assert (await session.exec(select(RecordModel.value).where(RecordModel.id == 1))).one() == 3

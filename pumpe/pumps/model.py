@@ -43,7 +43,13 @@ class ModelPump(BasePump):
         # was not in this run's source.
         await self._renew_lease()
         seen = col(self.model.pump_seen__)
-        query = delete(self.model).where(or_(seen.is_(None), seen != self._run_token))
+        # Deleted keys come from the database: bulk writes leave objects the session holds with a stale token, and
+        # evaluating the condition on them would mark rows this run kept as deleted.
+        query = (
+            delete(self.model)
+            .where(or_(seen.is_(None), seen != self._run_token))
+            .execution_options(synchronize_session="fetch")
+        )
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
