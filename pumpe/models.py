@@ -35,7 +35,8 @@ class PumpModel(SQLModel):
         default_factory=lambda: datetime.now(UTC),
         sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
     )
-    pump_touched__: bool = Field(default=True)
+    # Start of the latest run that fetched the row; runs only move it forward.
+    pump_seen__: datetime | None = None
     pump_extra__: dict[str, Any] | None = Field(
         default=None,
         sa_type=JSON(none_as_null=True),
@@ -84,7 +85,7 @@ class PumpModel(SQLModel):
 
     @classmethod
     def get_custom_fields(cls) -> set[str]:
-        private_fields = {"pump_hash__", "pump_modified__", "pump_touched__", "pump_extra__"}
+        private_fields = {"pump_hash__", "pump_modified__", "pump_seen__", "pump_extra__"}
         return {name for name in cls.model_fields if name not in private_fields}
 
     @classmethod
