@@ -39,10 +39,10 @@ class ModelPump(BasePump):
         if meta.mode == PumpMode.PARTIAL:
             return 0
 
-        # A row this run fetched is stamped no earlier than its start, so overlapping runs of the same model,
-        # whether they commit or fail midway, can only spare rows from this delete, never add rows to it.
+        # Every row this run fetched carries its generation; a lower one was not in this run's source.
+        await self._renew_lease()
         seen = col(self.model.pump_seen__)
-        query = delete(self.model).where(or_(seen.is_(None), seen < meta.started))
+        query = delete(self.model).where(or_(seen.is_(None), seen < self._generation))
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
@@ -63,34 +63,28 @@ class ModelPump(BasePump):
         meta.created += len(items)
         meta.updated += len(changed)
 
-        await self._mark_seen([*unchanged, *changed], meta)
-        await self._process_insert(items.values(), meta)
+        await self._renew_lease()
+        if unchanged:
+            query_seen = (
+                update(self.model)
+                .values(pump_seen__=self._generation, **self._keep_modified)
+                .where(self.id(self.model).in_(unchanged))
+            )
+            await self.session.exec(query_seen)
+
+        await self._process_insert(items.values())
         await self._process_update(changed.values())
         await self.session.commit()
-
-    async def _mark_seen(self, ids: list[Any], meta: PumpMeta) -> None:
-        if not ids:
-            return
-
-        # Conditional, so a run that started earlier but writes later cannot move the stamp back.
-        seen = col(self.model.pump_seen__)
-        query = (
-            update(self.model)
-            .values(pump_seen__=meta.started, **self._keep_modified)
-            .where(self.id(self.model).in_(ids), or_(seen.is_(None), seen < meta.started))
-        )
-        await self.session.exec(query)
 
     @property
     def _keep_modified(self) -> dict[str, Any]:
         # Scan bookkeeping is not a content change: assigning the column to itself keeps its onupdate from firing.
         return {"pump_modified__": self.model.pump_modified__}
 
-    async def _process_insert(self, items: Iterable[PumpModel], meta: PumpMeta) -> None:
-        mappings = [dict(i) | {"pump_seen__": meta.started} for i in items]
+    async def _process_insert(self, items: Iterable[PumpModel]) -> None:
+        mappings = [dict(i) | {"pump_seen__": self._generation} for i in items]
         await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, mappings))
 
     async def _process_update(self, items: Iterable[PumpModel]) -> None:
-        # The stamp is left to _mark_seen: writing it here would move it back for rows a later run already saw.
-        mappings = [{k: v for k, v in i if k != "pump_seen__"} for i in items]
+        mappings = [dict(i) | {"pump_seen__": self._generation} for i in items]
         await self.session.run_sync(lambda s: s.bulk_update_mappings(self.model, mappings))

@@ -1,3 +1,4 @@
+import re
 from asyncio import sleep
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from typing import Any
 
 import anyio
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
@@ -81,7 +83,7 @@ async def test_api_pump() -> None:
         assert len(record.pump_hash__) == 64
         assert record.pump_modified__.utcoffset() == timedelta(0)
         assert full.started < record.pump_modified__ < full.started + timedelta(seconds=5)
-        assert record.pump_seen__ == full.started
+        assert record.pump_seen__ == 1
         assert record.pump_extra__ == {"field3": "extra"}
         assert record.source == "source_0"
         assert record.field1 == 0
@@ -208,6 +210,51 @@ async def test_run_recovers_after_db_error() -> None:
         assert meta.created == 1
 
 
+FRACTIONAL_DATETIME = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{6}$")
+
+
+def drop_stored_fractions(parameters: object) -> object:
+    if isinstance(parameters, list):
+        return [drop_stored_fractions(p) for p in parameters]
+    if isinstance(parameters, tuple):
+        return tuple(
+            p[:-6] + "000000" if isinstance(p, str) and FRACTIONAL_DATETIME.match(p) else p for p in parameters
+        )
+    return parameters
+
+
+@pytest.mark.asyncio
+async def test_full_rerun_keeps_rows_with_second_precision_storage() -> None:
+    async with memory_session() as session:
+        # Store datetimes the way MariaDB DATETIME does, without fractional seconds; bound comparisons keep them.
+        def truncate(  # noqa: PLR0913, PLR0917
+            conn: object,  # noqa: ARG001
+            cursor: object,  # noqa: ARG001
+            statement: str,
+            parameters: object,
+            context: object,  # noqa: ARG001
+            executemany: bool,  # noqa: ARG001, FBT001
+        ) -> tuple[str, object]:
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE")):
+                parameters = drop_stored_fractions(parameters)
+            return statement, parameters
+
+        bind = session.bind
+        assert bind is not None
+        event.listen(bind.sync_engine, "before_cursor_execute", truncate, retval=True)
+
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = tuple({"id": i, "value": i} for i in range(1, 51))
+        for run in range(3):
+            meta = await pump.run()
+            assert meta is not None
+            assert meta.mode == PumpMode.FULL
+            assert meta.created == (50 if run == 0 else 0)
+            assert meta.skipped == (0 if run == 0 else 50)
+            assert meta.deleted == 0
+            assert await record_ids(session) == set(range(1, 51))
+
+
 @pytest.mark.asyncio
 async def test_reordered_extra_mapping_is_skipped() -> None:
     async with memory_session() as session:
@@ -280,68 +327,78 @@ def scripted_pump(session: AsyncSession, *script: dict[str, Any] | Gate | Except
 
 
 ROW_1 = {"id": 1, "value": 10}
+ROW_1_NEWER = {"id": 1, "value": 20}
 ROW_2 = {"id": 2, "value": 20}
 
 
+async def pump_in_background(pump: RecordModelPump, results: list[PumpMeta | BaseException | None]) -> None:
+    try:
+        results.append(await pump.run())
+    except Exception as e:  # noqa: BLE001
+        results.append(e)
+
+
 @pytest.mark.asyncio
-async def test_overlapping_full_runs_preserve_processed_rows_after_peer_failure(tmp_path: Path) -> None:
+async def test_overlapping_run_is_skipped_while_lease_is_held(tmp_path: Path) -> None:
     async with file_sessions(tmp_path) as (session_a, session_b):
         await seed_records(session_a, ROW_1, ROW_2)
 
         gate = Gate()
         run_a = scripted_pump(session_a, ROW_1, gate, ROW_2)
-        run_b = scripted_pump(session_b, RuntimeError("source down"))
-        results: list[PumpMeta | None] = []
-
-        async def pump_a() -> None:
-            results.append(await run_a.run())
+        run_b = scripted_pump(session_b)
+        results: list[PumpMeta | BaseException | None] = []
 
         async with anyio.create_task_group() as tg:
-            tg.start_soon(pump_a)
+            tg.start_soon(pump_in_background, run_a, results)
             await gate.reached.wait()
-            with pytest.raises(RuntimeError, match="source down"):
-                await run_b.run()
+            assert await run_b.run() is None
             gate.opened.set()
 
         [meta] = results
-        assert meta is not None
+        assert isinstance(meta, PumpMeta)
         assert meta.mode == PumpMode.FULL
         assert meta.skipped == 2
         assert meta.deleted == 0
         assert await record_ids(session_a) == {1, 2}
 
+        # The lease is released once the run ends, so the next run proceeds.
+        after = await scripted_pump(session_b, ROW_1, ROW_2).run()
+        assert after is not None
+        assert after.skipped == 2
+
 
 @pytest.mark.asyncio
-async def test_earlier_overlapping_run_cannot_move_seen_stamp_back(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("newer_source", "expected"), [((), {}), ((ROW_1_NEWER,), {1: 20})])
+async def test_stale_run_cannot_write_after_newer_run_takes_over(
+    tmp_path: Path,
+    newer_source: tuple[dict[str, Any], ...],
+    expected: dict[int, int],
+) -> None:
     async with file_sessions(tmp_path) as (session_a, session_b):
-        await seed_records(session_a, ROW_1, ROW_2)
+        await seed_records(session_a, ROW_1)
 
-        gate_a, gate_b = Gate(), Gate()
-        run_a = scripted_pump(session_a, ROW_1, gate_a, ROW_2)
-        run_b = scripted_pump(session_b, gate_b, ROW_1, RuntimeError("source down"))
-        results: list[PumpMeta | None] = []
-
-        async def pump_a() -> None:
-            results.append(await run_a.run())
-
-        b_done = anyio.Event()
-
-        async def pump_b() -> None:
-            with pytest.raises(RuntimeError, match="source down"):
-                await run_b.run()
-            b_done.set()
+        # An older partial run stalls past its lease before yielding a cached row.
+        gate = Gate()
+        stale = scripted_pump(session_b, gate, ROW_1)
+        stale.full_interval = timedelta(hours=1)
+        stale.lease_timeout = timedelta(0)
+        results: list[PumpMeta | BaseException | None] = []
 
         async with anyio.create_task_group() as tg:
-            # B starts first, so its stamp is older than A's, but it writes ROW_1 only after A has.
-            tg.start_soon(pump_b)
-            await gate_b.reached.wait()
-            tg.start_soon(pump_a)
-            await gate_a.reached.wait()
-            gate_b.opened.set()
-            await b_done.wait()
-            gate_a.opened.set()
+            tg.start_soon(pump_in_background, stale, results)
+            await gate.reached.wait()
 
-        [meta] = results
-        assert meta is not None
-        assert meta.deleted == 0
-        assert await record_ids(session_a) == {1, 2}
+            newer = await scripted_pump(session_a, *newer_source).run()
+            assert newer is not None
+            assert newer.mode == PumpMode.FULL
+            assert newer.deleted == 1 - len(expected)
+
+            gate.opened.set()
+
+        [error] = results
+        assert isinstance(error, RuntimeError)
+        assert "lease lost" in str(error)
+
+        session_a.expunge_all()
+        rows = (await session_a.exec(select(RecordModel))).all()
+        assert {r.id: r.value for r in rows} == expected

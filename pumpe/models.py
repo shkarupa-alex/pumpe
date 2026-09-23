@@ -29,14 +29,26 @@ class PumpMeta(SQLModel, table=True):
     elapsed: float | None = None
 
 
+class PumpLock(SQLModel, table=True):
+    """Lease that lets one run of a pump at a time write, across sessions and processes."""
+
+    __tablename__ = "pump_lock"
+
+    pump: str = Field(primary_key=True)
+    owner: str | None = None
+    expires: datetime | None = None
+    # Incremented by every run that takes the lease, so later runs always have larger generations.
+    generation: int = 0
+
+
 class PumpModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
     pump_modified__: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
     )
-    # Start of the latest run that fetched the row; runs only move it forward.
-    pump_seen__: datetime | None = None
+    # Lease generation of the latest run that fetched the row.
+    pump_seen__: int | None = None
     pump_extra__: dict[str, Any] | None = Field(
         default=None,
         sa_type=JSON(none_as_null=True),
