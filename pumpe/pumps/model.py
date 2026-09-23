@@ -50,7 +50,11 @@ class ModelPump(BasePump):
         return deleted
 
     async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
-        items = {self.id(i): i for i in map(self.model.model_validate, batch)}
+        validated = [self.model.model_validate(record) for record in batch]
+        if any(self.id(i) is None for i in validated):
+            # Rows are matched by primary key, so records without one would collapse into a single row.
+            raise ValueError(f"Source records must carry the primary key: {self.title}")
+        items = {self.id(i): i for i in validated}
 
         query_exist = select(self.model).where(self.id(self.model).in_(items))
         existing = (await self.session.exec(query_exist)).all()

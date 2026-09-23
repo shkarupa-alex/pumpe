@@ -682,3 +682,69 @@ async def test_model_pump_fetches_outside_a_transaction() -> None:
         assert meta is not None
         assert meta.created == 3
         assert pump.in_transaction == [False] * 4
+
+
+class OptionalKeyModel(PumpModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    value: str
+
+
+class OptionalKeyPump(ModelPump):
+    _model: type[PumpModel] = OptionalKeyModel
+
+    records: tuple[dict[str, Any], ...] = ()
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for record in self.records:
+            yield record
+
+
+@pytest.mark.asyncio
+async def test_missing_optional_primary_key_rejected() -> None:
+    async with memory_session() as session:
+        pump = OptionalKeyPump(session, timedelta(0), timedelta(0), timedelta(0))
+
+        pump.records = ({"value": "a"}, {"value": "b"})
+        with pytest.raises(ValueError, match="primary key"):
+            await pump.run()
+        session.expunge_all()
+        assert (await session.exec(select(OptionalKeyModel))).all() == []
+        assert (await session.exec(select(PumpMeta))).all() == []
+
+        pump.records = ({"id": 1, "value": "a"}, {"id": 2, "value": "b"})
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.created == 2
+
+
+@pytest.mark.asyncio
+async def test_same_instance_overlapping_run_does_not_take_over() -> None:
+    async with memory_session() as session:
+        gate = Gate()
+        pump = scripted_pump(session, gate, ROW_1)
+        results: list[PumpMeta | BaseException | None] = []
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump_in_background, pump, results)
+            await gate.reached.wait()
+            gate.reached = anyio.Event()
+            with anyio.fail_after(5):
+                assert await pump.run() is None
+            assert not gate.reached.is_set()
+            gate.opened.set()
+
+        [meta] = results
+        assert isinstance(meta, PumpMeta)
+        assert meta.created == 1
+        assert await record_ids(session) == {1}
+        assert await lease_owner(session) is None
+
+        # The instance stays usable once the run is over.
+        pump.script = (ROW_1,)
+        again = await pump.run()
+        assert again is not None
+        assert again.skipped == 1

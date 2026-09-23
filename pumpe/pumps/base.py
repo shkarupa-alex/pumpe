@@ -31,6 +31,7 @@ class BasePump(ABC):
         self.part_interval = part_interval
         self.past_interval = past_interval
         self.batch_size = batch_size
+        self._running = False
         self._lease: str | None = None
         # Tokens of earlier runs that a failed release or takeover may have left in pump_lock.
         self._unreleased: set[str] = set()
@@ -46,6 +47,18 @@ class BasePump(ABC):
         """Yield source records; implement as an async generator (``async def`` with ``yield``)."""
 
     async def run(self) -> PumpMeta | None:
+        # The lease token and the session belong to one run at a time; an overlapping call skips like a held lease.
+        if self._running:
+            self.logger.debug("Skip pumping, this pump is already running: %s", self.title)
+            return None
+
+        self._running = True
+        try:
+            return await self._run_once()
+        finally:
+            self._running = False
+
+    async def _run_once(self) -> PumpMeta | None:
         try:
             meta = await self._run()
         except BaseException:
