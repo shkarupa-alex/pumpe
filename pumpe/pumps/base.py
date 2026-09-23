@@ -175,7 +175,9 @@ class BasePump(ABC):
         try:
             taken = (await self.session.exec(takeover)).rowcount == 1
         except OperationalError as e:
-            if not lock_contended(e):
+            # Only another run's token is evidence that the lock belongs to its holder: SQLite locks the whole
+            # database, so a free or own lease can also be blocked by unrelated writes, which must not look like a skip.
+            if not lock_contended(e) or holder is None or holder in self._unreleased:
                 raise
             # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
             # and the engine gave up waiting on its lock (SQLite busy timeout, InnoDB lock wait timeout): it is held.

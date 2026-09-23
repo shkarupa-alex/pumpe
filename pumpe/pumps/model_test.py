@@ -909,3 +909,26 @@ async def test_competing_run_skips_while_holder_is_writing(
 
         # The competitor's session is left usable, and the released lease can be taken again.
         assert await scripted_pump(session_b, ROW_1).run() is not None
+
+
+@pytest.mark.asyncio
+async def test_unrelated_sqlite_writer_does_not_silently_skip_due_run(tmp_path: Path) -> None:
+    async with file_sessions(tmp_path, busy_timeout=0.2) as (session_a, session_b):
+        session_a.add(PumpLock(pump=RecordModel.__name__))
+        await session_a.commit()
+
+        # A write to another table holds SQLite's database lock, not the free lease.
+        session_a.add(RecordModel(id=99, value=0))
+        await session_a.flush()
+
+        pump = scripted_pump(session_b, ROW_1)
+        with pytest.raises(OperationalError, match="database is locked"):
+            await pump.run()
+        await session_a.rollback()
+
+        assert (await session_b.exec(select(PumpMeta))).all() == []
+        assert await lease_owner(session_b) is None
+
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.created == 1
