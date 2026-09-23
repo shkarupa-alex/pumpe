@@ -31,8 +31,8 @@ class PumpMeta(SQLModel, table=True):
 class PumpModel(SQLModel):
     pump_hash__: str | None = Field(default=None, index=True)
     pump_modified__: datetime = Field(
-        default_factory=datetime.now,
-        sa_column_kwargs={"onupdate": datetime.now},
+        default_factory=lambda: datetime.now(UTC),
+        sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
     )
     pump_touched__: bool = Field(default=True)
     pump_extra__: dict[str, Any] | None = Field(
@@ -56,11 +56,11 @@ class PumpModel(SQLModel):
 
     @field_validator("*", mode="after")
     @classmethod
-    def datetime_clear_timezone(cls, value: Any) -> Any:
-        if not isinstance(value, datetime) or not datetime.tzinfo:
+    def datetime_to_utc(cls, value: Any) -> Any:
+        if not isinstance(value, datetime) or value.utcoffset() is None:
             return value
 
-        return value.astimezone(UTC).replace(tzinfo=None)
+        return value.astimezone(UTC)
 
     @model_validator(mode="after")
     def compute_pump_hash(self) -> Self:

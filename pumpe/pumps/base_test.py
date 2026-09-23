@@ -24,6 +24,8 @@ class CustomTaskPump(BasePump):
     ) -> AsyncGenerator[dict[str, Any]]:
         assert isinstance(modified_since, datetime) or modified_since is None
         assert isinstance(created_after, datetime) or created_after is None
+        assert modified_since is None or modified_since.utcoffset() == timedelta(0)
+        assert created_after is None or created_after.utcoffset() == timedelta(0)
         for _ in range(100 // (2 if modified_since else 1)):
             yield {"success": True}
 
@@ -44,6 +46,7 @@ async def test_api_pump() -> None:
         full = await pump.run()
         assert isinstance(full, PumpMeta)
         assert full.mode == PumpMode.FULL
+        assert full.started.utcoffset() == timedelta(0)
         assert full.skipped == 100
         assert full.created == 0
         assert full.updated == 0
@@ -60,3 +63,4 @@ async def test_api_pump() -> None:
         assert part.created == 0
         assert part.updated == 0
         assert part.deleted == 0
+    await engine.dispose()

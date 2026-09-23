@@ -35,6 +35,8 @@ class CustomModelPump(ModelPump):
     ) -> AsyncGenerator[dict[str, Any]]:
         assert isinstance(modified_since, datetime) or modified_since is None
         assert isinstance(created_after, datetime) or created_after is None
+        assert modified_since is None or modified_since.utcoffset() == timedelta(0)
+        assert created_after is None or created_after.utcoffset() == timedelta(0)
 
         if self.num_calls < 2:
             self.num_calls += 1
@@ -61,6 +63,7 @@ async def test_api_pump() -> None:
         full = await pump.run()
         assert isinstance(full, PumpMeta)
         assert full.mode == PumpMode.FULL
+        assert full.started.utcoffset() == timedelta(0)
         assert full.skipped == 0
         assert full.created == 100
         assert full.updated == 0
@@ -70,6 +73,7 @@ async def test_api_pump() -> None:
         record = (await session.exec(query)).first()
         assert isinstance(record, CustomModel)
         assert len(record.pump_hash__) == 64
+        assert record.pump_modified__.utcoffset() == timedelta(0)
         assert full.started < record.pump_modified__ < full.started + timedelta(seconds=5)
         assert record.pump_touched__
         assert record.pump_extra__ == {"field3": "extra"}
@@ -97,3 +101,4 @@ async def test_api_pump() -> None:
         assert part.created == 0
         assert part.updated == 0
         assert part.deleted == 125
+    await engine.dispose()
