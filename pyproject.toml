@@ -1,13 +1,16 @@
 [build-system]
 requires = [
-    "setuptools>=80.9.0",
-    "setuptools-git-versioning>=2.1.0",
-    "wheel>=0.45.1",
+    "setuptools>=84.0.0",
+    "setuptools-git-versioning>=3.1.0",
+    "wheel>=0.48.0",
 ]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools-git-versioning]
 enabled = true
+
+[tool.setuptools.package-data]
+pumpe = ["py.typed"]
 
 [project]
 name = "pumpe"
@@ -16,25 +19,35 @@ description = "Pumping base classes"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "aioitertools>=0.12.0",
-    "anyio>=4.9.0",
+    "aioitertools>=0.13.0",
+    "anyio>=4.15.1",
     "fast-depends>=2.4.12",
-    "fastapi[standard]>=0.116.1",
+    "fastapi[standard]>=0.141.1",
     "httpx[http2]>=0.28.1",
-    "pydantic>=2.11.7",
-    "pydantic-settings>=2.10.1",
-    "pytest-asyncio>=1.1.0",
-    "sqlmodel>=0.0.24",
-    "tenacity>=9.1.2",
-    "uvicorn>=0.35.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy[asyncio]>=2.0.54",
+    "sqlmodel>=0.0.46",
+    "tenacity>=9.1.4",
+    "uvicorn>=0.53.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/shkarupa-alex/pumpe"
 
 [dependency-groups]
 dev = [
-    "setuptools>=80.9.0",
-    "setuptools-git-versioning>=2.1.0",
-    "sqlalchemy[aiosqlite]>=2.0.43",
-    "wheel>=0.45.1",
+    "mypy==2.3.1",
+    "packaging>=26.3",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pyyaml>=6.0.3",
+    "ruff==0.16.8",
+    "setuptools>=84.0.0",
+    "setuptools-git-versioning>=3.1.0",
+    "sqlalchemy[aiosqlite]>=2.0.54",
+    "types-pyyaml>=6.0.12.20260906",
+    "wheel>=0.48.0",
 ]
 
 [tool.ruff]
@@ -48,7 +61,7 @@ docstring-code-format = true
 
 [tool.ruff.lint]
 select = ["ALL"]
-ignore = ["EM", "TRY003", "D1", "FA"]
+ignore = ["EM", "TRY003", "D1", "FA", "CPY001"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -58,7 +71,7 @@ no-lines-before = ["standard-library"]
 known-third-party = []
 
 [tool.ruff.lint.extend-per-file-ignores]
-"*_test.py" = ["S101", "S311"]
+"*_test.py" = ["S101", "S311", "PLR2004"]
 
 
 [tool.mypy]
@@ -69,10 +82,6 @@ strict = true
 addopts = ["--strict-config", "--strict-markers"]
 xfail_strict = true
 asyncio_default_fixture_loop_scope = "function"
-
-[tool.pytest_env]
-BITRIX24_API_WEBHOOK_URL = "https://bitrix24.com/rest/0/test/"
-
 
 [tool.coverage.report]
 exclude_also = ["if typing.TYPE_CHECKING:"]

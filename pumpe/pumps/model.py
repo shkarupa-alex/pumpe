@@ -3,7 +3,7 @@ from functools import cached_property
 from operator import attrgetter
 from typing import Any
 
-from sqlmodel import delete, select, update
+from sqlmodel import col, delete, or_, select, update
 
 from pumpe.models import PumpMeta, PumpMode, PumpModel
 from pumpe.pumps.base import BasePump
@@ -17,7 +17,7 @@ class ModelPump(BasePump):
         if self._model is None:
             raise ValueError("Model should be set via `_model` property")
         if not issubclass(self._model, PumpModel):
-            raise ValueError("Model should be a subclass of `PumpModel`")
+            raise TypeError("Model should be a subclass of `PumpModel`")
         if not getattr(self._model, "model_config", {}).get("table", False):
             raise ValueError("Model should have a table backend")
 
@@ -28,60 +28,81 @@ class ModelPump(BasePump):
         return self.model.__name__
 
     @cached_property
-    def id(self) -> attrgetter:
+    def id(self) -> "attrgetter[Any]":
         return attrgetter(self.model.get_primary_key())
 
-    async def _process_all(self, meta: PumpMeta) -> PumpMeta:
-        await self._untouch_all(meta)
+    async def _process_all(self, meta: PumpMeta) -> None:
         await super()._process_all(meta)
-        meta.deleted = await self._delete_untouched(meta)
+        meta.deleted = await self._delete_unseen(meta)
 
-        return meta
-
-    async def _untouch_all(self, meta: PumpMeta) -> None:
-        if meta.mode == PumpMode.PARTIAL:
-            return
-
-        query = update(self.model).values(pump_touched__=False)
-        await self.session.exec(query)
-        await self.session.commit()
-
-    async def _delete_untouched(self, meta: PumpMeta) -> int:
+    async def _delete_unseen(self, meta: PumpMeta) -> int:
         if meta.mode == PumpMode.PARTIAL:
             return 0
 
-        query = delete(self.model).where(self.model.pump_touched__.is_(False))
+        # Every row this run fetched carries its token, and runs are serialized, so any other stamp means the row
+        # was not in this run's source.
+        await self._renew_lease()
+        seen = col(self.model.pump_seen__)
+        # Deleted keys come from the database: bulk writes leave objects the session holds with a stale token, and
+        # evaluating the condition on them would mark rows this run kept as deleted.
+        query = (
+            delete(self.model)
+            .where(or_(seen.is_(None), seen != self._run_token))
+            .execution_options(synchronize_session="fetch")
+        )
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
         return deleted
 
-    async def _process_batch(self, batch: tuple[dict[str, Any]], meta: PumpMeta) -> None:
-        items = map(self.model.model_validate, batch)
-        items = {self.id(i): i for i in items}
+    async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
+        validated = [self.model.model_validate(record) for record in batch]
+        if any(self.id(i) is None for i in validated):
+            # Rows are matched by primary key, so records without one would collapse into a single row.
+            raise ValueError(f"Source records must carry the primary key: {self.title}")
+        items = {self.id(i): i for i in validated}
 
-        query_exist = select(self.model).where(self.id(self.model).in_(items))
-        existing = (await self.session.exec(query_exist)).all()
+        # Stored hashes as plain values, not row objects: an object that stays in the session's identity map is not
+        # reloaded by a select, and the bulk writes below never update it, so its hash could be stale.
+        key = self.id(self.model)
+        query_exist = select(key, col(self.model.pump_hash__)).where(key.in_(items))
+        stored = dict((await self.session.exec(query_exist)).all())
+        if collated := stored.keys() - items.keys():
+            # The database matched these under the key column's collation (case, accents, trailing spaces), and
+            # rewriting a stored key to another spelling is not this pump's call to make.
+            # Two such spellings arriving in one batch reach the database's unique constraint instead.
+            message = f"Stored keys {sorted(map(str, collated))} match source keys only under the key's collation"
+            raise ValueError(f"{message}, give the key a binary collation: {self.title}")
 
-        unchanged = {
-            self.id(e): items.pop(self.id(e)) for e in existing if items[self.id(e)].pump_hash__ == e.pump_hash__
-        }
-        changed = {self.id(e): items.pop(self.id(e)) for e in existing if self.id(e) not in unchanged}
+        unchanged = {k: items.pop(k) for k, stored_hash in stored.items() if items[k].pump_hash__ == stored_hash}
+        changed = {k: items.pop(k) for k in stored if k not in unchanged}
 
         meta.skipped += len(unchanged)
         meta.created += len(items)
         meta.updated += len(changed)
 
-        if meta.mode == PumpMode.FULL:
-            query_touch = update(self.model).values(pump_touched__=True).where(self.id(self.model).in_(unchanged))
-            await self.session.exec(query_touch)
+        if unchanged:
+            query_seen = (
+                update(self.model)
+                .values(pump_seen__=self._run_token, **self._keep_modified)
+                .where(self.id(self.model).in_(unchanged))
+            )
+            await self.session.exec(query_seen)
 
         await self._process_insert(items.values())
         await self._process_update(changed.values())
-        await self.session.commit()
+
+    @property
+    def _keep_modified(self) -> dict[str, Any]:
+        # Scan bookkeeping is not a content change: assigning the column to itself keeps its onupdate from firing.
+        return {"pump_modified__": self.model.pump_modified__}
 
     async def _process_insert(self, items: Iterable[PumpModel]) -> None:
-        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, items))
+        mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]
+        # Explicit nulls are written as nulls: omitted, they would take a column's server default, which the hash
+        # computed from the source record would then hide from every later run.
+        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, mappings, render_nulls=True))
 
     async def _process_update(self, items: Iterable[PumpModel]) -> None:
-        await self.session.run_sync(lambda s: s.bulk_update_mappings(self.model, items))
+        mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]
+        await self.session.run_sync(lambda s: s.bulk_update_mappings(self.model, mappings))

@@ -1,17 +1,44 @@
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from logging import getLogger
+from time import monotonic
 from typing import Any
+from uuid import uuid4
 
-from aioitertools import batched as abatched
-from sqlmodel import select
+import anyio
+from aioitertools.itertools import batched as abatched
+from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlmodel import col, or_, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from pumpe.models import PumpMeta, PumpMode
+from pumpe.models import PumpLock, PumpMeta, PumpMode
+
+# SQLite's primary result codes, PostgreSQL's SQLSTATEs and MySQL/MariaDB's error numbers for a lock wait that timed
+# out or a deadlock.
+SQLITE_LOCK_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
+POSTGRESQL_LOCK_STATES = frozenset({"55P03", "40P01"})  # lock_not_available, deadlock_detected
+MYSQL_LOCK_ERRORS = frozenset({1205, 1213})  # ER_LOCK_WAIT_TIMEOUT, ER_LOCK_DEADLOCK
+
+
+def lock_contended(error: DBAPIError) -> bool:
+    """Tell a statement that failed waiting on another transaction's lock from a genuine database error."""
+    orig = error.orig
+    sqlite_code = getattr(orig, "sqlite_errorcode", None)
+    if isinstance(sqlite_code, int):
+        return sqlite_code & 0xFF in SQLITE_LOCK_CODES
+    # MySQL drivers put the error number first, and also set a generic sqlstate such as HY000, so it goes before it.
+    args: tuple[object, ...] = getattr(orig, "args", ())
+    if args and isinstance(args[0], int):
+        return args[0] in MYSQL_LOCK_ERRORS
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return sqlstate in POSTGRESQL_LOCK_STATES
 
 
 class BasePump(ABC):
+    # Must exceed the longest pause between two batches: a run that stays silent longer loses its lease.
+    lease_timeout = timedelta(minutes=10)
+
     def __init__(
         self,
         session: AsyncSession,
@@ -25,28 +52,50 @@ class BasePump(ABC):
         self.part_interval = part_interval
         self.past_interval = past_interval
         self.batch_size = batch_size
+        self._running = False
+        self._lease: str | None = None
+        # Tokens of earlier runs that a failed release or takeover may have left in pump_lock.
+        self._unreleased: set[str] = set()
 
         self.logger = getLogger("pumpe")
 
     @abstractmethod
-    async def _fetch(
+    def _fetch(
         self,
         modified_since: datetime | None,
         created_after: datetime | None,
-    ) -> AsyncGenerator[dict[str, Any]]:
-        pass
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield source records; implement as an async generator (``async def`` with ``yield``)."""
 
     async def run(self) -> PumpMeta | None:
-        meta = await self._new_meta()
-        if not meta:
-            self.logger.debug("Skip pumping: %s", self.title)
+        # The lease token and the session belong to one run at a time; an overlapping call skips like a held lease.
+        if self._running:
+            self.logger.debug("Skip pumping, this pump is already running: %s", self.title)
             return None
 
-        self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
-        await self._process_all(meta)
-        self.logger.debug("Finish pumping (%s): %s", meta.mode, self.title)
+        self._running = True
+        try:
+            return await self._run_once()
+        finally:
+            self._running = False
 
-        await self._save_meta(meta)
+    async def _run_once(self) -> PumpMeta | None:
+        try:
+            meta = await self._run()
+        except BaseException:
+            # The session outlives a single run, so a failed flush must not leave it unusable for the next one.
+            with anyio.CancelScope(shield=True):
+                await self.session.rollback()
+                try:
+                    await self._release_lease()
+                except Exception:
+                    # Never mask the run's own failure; the next run takes the unreleased lease back by its token.
+                    await self.session.rollback()
+                    self.logger.warning("Could not release the lease: %s", self.title, exc_info=True)
+            raise
+
+        if meta is None:
+            return None
 
         self.logger.info(
             "Pumped (%s) %s in %.1f seconds: skipped/%d, created/%d, updated/%d, deleted/%d",
@@ -61,27 +110,179 @@ class BasePump(ABC):
 
         return meta
 
+    async def _run(self) -> PumpMeta | None:
+        # Checked before the lease too, so polling a pump that is not due writes nothing.
+        if not await self._new_meta():
+            self.logger.debug("Skip pumping: %s", self.title)
+            await self.session.commit()
+            return None
+
+        if not await self._acquire_lease():
+            self.logger.debug("Skip pumping, another run holds the lease: %s", self.title)
+            return None
+
+        # Decided again under the lease: another run may have finished in between.
+        meta = await self._new_meta()
+        if not meta:
+            self.logger.debug("Skip pumping: %s", self.title)
+            await self._release_lease()
+            return None
+
+        self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
+        began = monotonic()
+        await self._process_all(meta)
+        # Measured around every step of _process_all, including what subclasses do after the batches.
+        meta.elapsed = monotonic() - began
+        self.logger.debug("Finish pumping (%s): %s", meta.mode, self.title)
+
+        await self._save_meta(meta)
+
+        return meta
+
     @property
     def title(self) -> str:
         return self.__class__.__name__
 
+    async def _acquire_lease(self) -> bool:
+        # Overlapping runs of one pump cannot be ordered safely (an older run could write after a newer one),
+        # so runs are serialized; an expired lease is taken over, as its holder is presumed dead.
+        await self._ensure_lease_row()
+
+        now = datetime.now(UTC)
+        if self._lease is not None:
+            self._unreleased.add(self._lease)
+        # Read without locking first: the holder keeps the row locked through each of its write transactions, and
+        # a takeover update would wait on that lock (InnoDB, SQLite) and time out instead of skipping.
+        query = select(PumpLock.owner, PumpLock.expires).where(PumpLock.pump == self.title)
+        row = (await self.session.exec(query)).first()
+        await self.session.commit()
+        if row is None:
+            # Deleted by hand since it was ensured; the next run creates it again.
+            self._forget_lease()
+            return False
+        holder, expires = row
+        if holder is not None and holder not in self._unreleased and (expires is None or expires >= now):
+            # A single row holds a single token, so none of this instance's own is left to release.
+            self._forget_lease()
+            return False
+
+        owner = uuid4().hex
+        free = or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now)
+        if self._unreleased:
+            # This instance's own leases, left behind by a release or takeover that failed.
+            free = or_(free, col(PumpLock.owner).in_(self._unreleased))
+        takeover = (
+            update(PumpLock)
+            .where(col(PumpLock.pump) == self.title, free)
+            .values(owner=owner, expires=now + self.lease_timeout)
+        )
+
+        try:
+            taken = (await self.session.exec(takeover)).rowcount == 1
+        except DBAPIError as e:
+            # A lock on the lease row proves a holder only where locks are per row and the row carries another run's
+            # token; SQLite locks the whole database, so there any unrelated writer looks the same.
+            foreign = holder is not None and holder not in self._unreleased
+            if not (self._locks_rows and foreign and lock_contended(e)):
+                raise
+            # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
+            # and the engine gave up waiting on its row lock (InnoDB lock wait timeout, PostgreSQL lock_timeout).
+            await self.session.rollback()
+            # Only a holder that overran lease_timeout gets here; a warning keeps a stuck one visible.
+            self.logger.warning("Skip pumping, the expired lease is still locked by its holder: %s", self.title)
+            self._lease = None
+            return False
+        # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
+        # A takeover that failed to execute wrote nothing, so there is no new token to release.
+        self._lease = owner
+        if not taken:
+            # Not even one of the unreleased tokens is in pump_lock, or the update would have matched it.
+            await self.session.rollback()
+            self._forget_lease()
+            return False
+
+        await self.session.commit()
+        # The takeover replaced whichever token was there.
+        self._unreleased.clear()
+        return True
+
+    @property
+    def _locks_rows(self) -> bool:
+        """Whether the database locks single rows, so a wait on the lease row means another transaction holds it."""
+        return self.session.get_bind(PumpLock).dialect.name != "sqlite"
+
+    async def _ensure_lease_row(self) -> None:
+        query = select(PumpLock.pump).where(PumpLock.pump == self.title)
+        exists = (await self.session.exec(query)).first() is not None
+        await self.session.commit()
+        if exists:
+            return
+
+        # Created on its own: in the takeover's transaction, InnoDB's gap lock on the missing key would
+        # deadlock two first runs of the same pump against each other.
+        self.session.add(PumpLock(pump=self.title))
+        try:
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
+
+    @property
+    def _run_token(self) -> str:
+        """The current run's lease token, unique per run."""
+        if self._lease is None:
+            raise RuntimeError(f"Pump holds no lease: {self.title}")
+        return self._lease
+
+    async def _renew_lease(self) -> None:
+        """Fence the current transaction: call it before the first write of every transaction a run commits."""
+        # The row lock taken by this update is held until commit, so the lease cannot change hands in between.
+        query = (
+            update(PumpLock)
+            .where(col(PumpLock.pump) == self.title, col(PumpLock.owner) == self._lease)
+            .values(expires=datetime.now(UTC) + self.lease_timeout)
+        )
+        if self._lease is None or (await self.session.exec(query)).rowcount != 1:
+            raise RuntimeError(f"Pump lease lost, another run has taken over: {self.title}")
+
+    async def _release_lease(self) -> None:
+        if self._lease is None and not self._unreleased:
+            return
+
+        await self._exec_release()
+        await self.session.commit()
+        # Forgotten only once committed: an interrupted release is retried by run()'s failure handling.
+        self._forget_lease()
+
+    async def _exec_release(self) -> None:
+        tokens = self._unreleased | ({self._lease} if self._lease is not None else set())
+        query = (
+            update(PumpLock)
+            .where(col(PumpLock.pump) == self.title, col(PumpLock.owner).in_(tokens))
+            .values(owner=None, expires=None)
+        )
+        await self.session.exec(query)
+
+    def _forget_lease(self) -> None:
+        self._lease = None
+        self._unreleased.clear()
+
     async def _new_meta(self) -> PumpMeta | None:
-        started = datetime.now()
+        now = datetime.now(UTC)
 
         last_full = await self._get_last(PumpMode.FULL)
         last_part = await self._get_last(PumpMode.PARTIAL)
 
-        if not last_full or last_full.started + self.full_interval < started:
+        if not last_full or last_full.started + self.full_interval < now:
             mode = PumpMode.FULL
-        elif last_part and last_part.started + self.part_interval < started:
+        elif last_part and last_part.started + self.part_interval < now:
             mode = PumpMode.PARTIAL
         else:
             return None
 
-        return PumpMeta(pump=self.title, mode=mode, started=started)
+        return PumpMeta(pump=self.title, mode=mode, started=now)
 
     async def _get_last(self, mode: PumpMode) -> PumpMeta | None:
-        query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(PumpMeta.id.desc()).limit(1)
+        query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(col(PumpMeta.id).desc()).limit(1)
         if mode == PumpMode.FULL:
             query = query.where(PumpMeta.mode == mode)
 
@@ -92,19 +293,34 @@ class BasePump(ABC):
             modified_since = None
             created_after = None
         else:
-            modified_since = (await self._get_last(PumpMode.PARTIAL)).started
+            last = await self._get_last(PumpMode.PARTIAL)
+            if last is None:
+                raise RuntimeError(f"Partial pumping requires a previous run: {self.title}")
+            modified_since = last.started
             created_after = modified_since - self.past_interval
 
+        # Source I/O can be slow: never wait on it inside the transaction the metadata queries opened.
+        await self.session.commit()
         generator = self._fetch(modified_since=modified_since, created_after=created_after)
         async for batch in abatched(generator, self.batch_size):
+            # One fenced transaction per batch: a run that has lost its lease cannot commit a stale batch.
+            await self._renew_lease()
             await self._process_batch(batch, meta)
+            await self.session.commit()
 
-        meta.elapsed = (datetime.now() - meta.started).total_seconds()
-
-    async def _process_batch(self, batch: tuple[dict[str, Any]], meta: PumpMeta) -> None:
+    async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
+        """Write one batch inside the transaction the caller fences and commits; do not commit here."""
         meta.skipped += len(batch)
 
     async def _save_meta(self, meta: PumpMeta) -> None:
+        # The lease is released with the last write: a later commit would expire meta's loaded attributes.
+        await self._renew_lease()
         self.session.add(meta)
+        await self._exec_release()
         await self.session.commit()
+        self._forget_lease()
         await self.session.refresh(meta)
+        # End the refresh's transaction too, so the session does not idle inside one until the next run;
+        # expunged first, meta keeps its loaded attributes whatever expire_on_commit is.
+        self.session.expunge(meta)
+        await self.session.commit()
