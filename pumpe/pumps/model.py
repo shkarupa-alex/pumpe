@@ -86,7 +86,9 @@ class ModelPump(BasePump):
 
     async def _process_insert(self, items: Iterable[PumpModel]) -> None:
         mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]
-        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, mappings))
+        # Explicit nulls are written as nulls: omitted, they would take a column's server default, which the hash
+        # computed from the source record would then hide from every later run.
+        await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, mappings, render_nulls=True))
 
     async def _process_update(self, items: Iterable[PumpModel]) -> None:
         mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]

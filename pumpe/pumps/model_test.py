@@ -11,7 +11,7 @@ from uuid import UUID
 
 import anyio
 import pytest
-from sqlalchemy import event
+from sqlalchemy import Column, Integer, event, text
 from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, delete, select
@@ -815,3 +815,44 @@ async def test_run_rechecks_schedule_under_the_lease(tmp_path: Path) -> None:
         metas = (await session_a.exec(select(PumpMeta).where(PumpMeta.pump == RecordModel.__name__))).all()
         assert len(metas) == 1
         assert await lease_owner(session_a) is None
+
+
+class DefaultedModel(PumpModel, table=True):
+    id: int = Field(primary_key=True)
+    value: int | None = Field(default=None, sa_column=Column(Integer, nullable=True, server_default=text("7")))
+
+
+class DefaultedPump(ModelPump):
+    _model: type[PumpModel] = DefaultedModel
+
+    records: tuple[dict[str, Any], ...] = ()
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for record in self.records:
+            yield record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, 3])
+async def test_explicit_null_survives_server_default_and_rerun(value: int | None) -> None:
+    async with memory_session() as session:
+        pump = DefaultedPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = ({"id": 1, "value": value},)
+
+        async def stored() -> int | None:
+            session.expunge_all()
+            return (await session.exec(select(DefaultedModel.value))).one()
+
+        first = await pump.run()
+        assert first is not None
+        assert first.created == 1
+        assert await stored() == value
+
+        second = await pump.run()
+        assert second is not None
+        assert (second.skipped, second.updated) == (1, 0)
+        assert await stored() == value
