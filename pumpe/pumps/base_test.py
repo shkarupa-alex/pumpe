@@ -6,12 +6,13 @@ from typing import Any
 
 import anyio
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from pumpe.models import PumpMeta, PumpMode
-from pumpe.pumps.base import BasePump
+from pumpe.pumps.base import BasePump, lock_contended
 from pumpe.pumps.model_test import Gate, file_sessions
 
 
@@ -207,3 +208,29 @@ async def test_fetch_starts_outside_a_transaction(*, expire_on_commit: bool) -> 
             assert meta.mode == mode
             assert pump.in_transaction == [False] * 4
     await engine.dispose()
+
+
+class DriverError(Exception):
+    def __init__(self, *args: object, **attributes: object) -> None:
+        super().__init__(*args)
+        for name, value in attributes.items():
+            setattr(self, name, value)
+
+
+@pytest.mark.parametrize(
+    ("orig", "contended"),
+    [
+        (DriverError("database is locked", sqlite_errorcode=5), True),
+        (DriverError("database table is locked", sqlite_errorcode=262), True),
+        (DriverError("disk I/O error", sqlite_errorcode=10), False),
+        (DriverError("could not obtain lock", sqlstate="55P03"), True),
+        (DriverError("deadlock detected", pgcode="40P01"), True),
+        (DriverError("terminating connection", sqlstate="57P01"), False),
+        (DriverError(1205, "Lock wait timeout exceeded"), True),
+        (DriverError(1213, "Deadlock found"), True),
+        (DriverError(2013, "Lost connection"), False),
+        (DriverError("injected failure"), False),
+    ],
+)
+def test_lock_contended(orig: Exception, *, contended: bool) -> None:
+    assert lock_contended(OperationalError("UPDATE pump_lock", None, orig)) is contended

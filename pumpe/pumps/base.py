@@ -13,6 +13,25 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from pumpe.models import PumpLock, PumpMeta, PumpMode
 
+# SQLite's primary result codes, PostgreSQL's SQLSTATEs and MySQL/MariaDB's error numbers for a lock wait that timed
+# out or a deadlock.
+SQLITE_LOCK_CODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
+POSTGRESQL_LOCK_STATES = frozenset({"55P03", "40P01"})  # lock_not_available, deadlock_detected
+MYSQL_LOCK_ERRORS = frozenset({1205, 1213})  # ER_LOCK_WAIT_TIMEOUT, ER_LOCK_DEADLOCK
+
+
+def lock_contended(error: OperationalError) -> bool:
+    """Tell a statement that failed waiting on another transaction's lock from a genuine database error."""
+    orig = error.orig
+    sqlite_code = getattr(orig, "sqlite_errorcode", None)
+    if isinstance(sqlite_code, int):
+        return sqlite_code & 0xFF in SQLITE_LOCK_CODES
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if isinstance(sqlstate, str):
+        return sqlstate in POSTGRESQL_LOCK_STATES
+    args: tuple[object, ...] = getattr(orig, "args", ())
+    return bool(args) and args[0] in MYSQL_LOCK_ERRORS
+
 
 class BasePump(ABC):
     # Must exceed the longest pause between two batches: a run that stays silent longer loses its lease.
@@ -156,7 +175,7 @@ class BasePump(ABC):
         try:
             taken = (await self.session.exec(takeover)).rowcount == 1
         except OperationalError as e:
-            if e.connection_invalidated:
+            if not lock_contended(e):
                 raise
             # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
             # and the engine gave up waiting on its lock (SQLite busy timeout, InnoDB lock wait timeout): it is held.
