@@ -13,7 +13,7 @@ from uuid import UUID
 import anyio
 import pytest
 from sqlalchemy import Column, Integer, String, event, text
-from sqlalchemy.exc import OperationalError, StatementError
+from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -1040,3 +1040,17 @@ async def test_elapsed_includes_deletion() -> None:
         stored = (await session.exec(select(PumpMeta.elapsed).where(PumpMeta.id == meta.id))).one()
         assert stored is not None
         assert stored >= 0.5
+
+
+@pytest.mark.asyncio
+async def test_collating_keys_in_one_batch_hit_the_unique_constraint() -> None:
+    async with memory_session() as session:
+        pump = NocasePump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = ({"code": "abc", "value": 1},)
+        assert await pump.run() is not None
+
+        # Both spellings in one batch: the stored one matches exactly, so the other is left to the database.
+        pump.records = ({"code": "abc", "value": 1}, {"code": "ABC", "value": 2})
+        with pytest.raises(IntegrityError):
+            await pump.run()
+        assert (await session.exec(select(NocaseModel.code, NocaseModel.value))).all() == [("abc", 1)]

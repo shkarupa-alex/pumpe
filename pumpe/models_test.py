@@ -4,12 +4,15 @@ from uuid import UUID
 
 import pytest
 from pydantic import NaiveDatetime
+from sqlalchemy.dialects import mysql
+from sqlalchemy.engine import Dialect
 from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.schema import CreateTable
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from pumpe.models import PumpModel
+from pumpe.models import PreciseUTCDateTime, PumpLock, PumpMeta, PumpModel
 
 
 class EventModel(PumpModel, table=True):
@@ -109,3 +112,19 @@ async def test_naive_datetime_rejected_for_aware_column() -> None:
         with pytest.raises(StatementError, match="timezone information"):
             await session.commit()
     await engine.dispose()
+
+
+@pytest.mark.parametrize("dialect", [mysql.dialect(), mysql.dialect(is_mariadb=True)])
+def test_own_timestamps_keep_microseconds_on_mysql(dialect: Dialect) -> None:
+    tables = [PumpMeta.__table__, PumpLock.__table__, EventModel.__table__]  # type: ignore[attr-defined]
+    ddl = {table.name: str(CreateTable(table).compile(dialect=dialect)) for table in tables}
+    assert "started DATETIME(6) NOT NULL" in ddl["pump_meta"]
+    assert "expires DATETIME(6)" in ddl["pump_lock"]
+    assert "pump_modified__ DATETIME(6) NOT NULL" in ddl[EventModel.__table__.name]  # type: ignore[attr-defined]
+
+    # Still UTCDateTime underneath: aware values are bound in UTC, and naive ones are refused.
+    precise = PreciseUTCDateTime()
+    moscow = datetime(2026, 1, 1, 3, tzinfo=timezone(timedelta(hours=3)))
+    assert precise.process_bind_param(moscow, dialect) == datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(ValueError, match="timezone"):
+        precise.process_bind_param(datetime(2026, 1, 1), dialect)  # noqa: DTZ001

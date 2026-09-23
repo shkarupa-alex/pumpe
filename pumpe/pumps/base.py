@@ -279,9 +279,7 @@ class BasePump(ABC):
         else:
             return None
 
-        # Stored in whole seconds, which every DATETIME keeps exactly: MySQL rounds fractions up, and a start stored
-        # later than this run began fetching would make the next partial run skip changes made in between.
-        return PumpMeta(pump=self.title, mode=mode, started=now.replace(microsecond=0))
+        return PumpMeta(pump=self.title, mode=mode, started=now)
 
     async def _get_last(self, mode: PumpMode) -> PumpMeta | None:
         query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(col(PumpMeta.id).desc()).limit(1)

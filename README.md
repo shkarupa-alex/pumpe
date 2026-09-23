@@ -10,14 +10,16 @@ See [`pumpe/pumps/model_test.py`](https://github.com/shkarupa-alex/pumpe/blob/ma
 Datetime fields are timezone-aware and stored in UTC (SQLModel's `UTCDateTime`).
 Pass aware values to `datetime` fields: they are normalized to UTC, and naive values are rejected when written.
 Annotate a field with pydantic's `NaiveDatetime` to store naive values as they are.
+pumpe's own timestamps keep microseconds on MySQL/MariaDB too (`DATETIME(6)`, via `PreciseUTCDateTime`).
 `_fetch` receives `modified_since` and `created_after` as aware UTC datetimes.
 
 ## Primary keys
 
 Source records must carry the model's primary key, and rows are matched by it as Python values.
 If the source can send string keys that differ only in case, accents or trailing spaces, give the key column a binary
-collation (MySQL/MariaDB compare strings case-insensitively by default); otherwise such a record fails the run with
-`ValueError`.
+collation (MySQL/MariaDB compare strings case-insensitively by default). Otherwise such records fail the run:
+with `ValueError` when a stored key matches a source key only under the collation, or with the database's
+`IntegrityError` when two such spellings arrive in one batch.
 
 ## Concurrent runs
 

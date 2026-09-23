@@ -64,6 +64,7 @@ class ModelPump(BasePump):
         if collated := stored.keys() - items.keys():
             # The database matched these under the key column's collation (case, accents, trailing spaces), and
             # rewriting a stored key to another spelling is not this pump's call to make.
+            # Two such spellings arriving in one batch reach the database's unique constraint instead.
             message = f"Stored keys {sorted(map(str, collated))} match source keys only under the key's collation"
             raise ValueError(f"{message}, give the key a binary collation: {self.title}")
 
