@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
@@ -74,9 +75,10 @@ class PumpModel(SQLModel):
 
         self.__dict__["pump_extra__"] = extra
 
+        # Sorted keys: sources may reorder JSON objects between fetches without changing their content.
         fields = self.get_custom_fields() | {"pump_extra__"}
-        dump = self.model_dump_json(include=fields).encode()
-        self.__dict__["pump_hash__"] = hashlib.sha256(dump).hexdigest()
+        dump = json.dumps(self.model_dump(mode="json", include=fields), sort_keys=True, separators=(",", ":"))
+        self.__dict__["pump_hash__"] = hashlib.sha256(dump.encode()).hexdigest()
 
         return self
 

@@ -10,3 +10,4 @@ See `pumpe/pumps/model_test.py` for example.
 Datetime fields are timezone-aware and stored in UTC (SQLModel's `UTCDateTime`).
 Pass aware values to `datetime` fields: they are normalized to UTC, and naive values are rejected when written.
 Annotate a field with pydantic's `NaiveDatetime` to store naive values as they are.
+`_fetch` receives `modified_since` and `created_after` as aware UTC datetimes.

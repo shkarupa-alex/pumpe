@@ -23,6 +23,19 @@ def test_in_background_serves_health() -> None:
         httpx.get(f"http://127.0.0.1:{port}/health")
 
 
+def test_in_background_second_entry() -> None:
+    port = free_port()
+    server = HealthServer(host="127.0.0.1", port=port)
+
+    for _ in range(2):
+        with server.in_background():
+            response = httpx.get(f"http://127.0.0.1:{port}/health")
+            assert response.status_code == httpx.codes.NO_CONTENT
+
+        with pytest.raises(httpx.ConnectError):
+            httpx.get(f"http://127.0.0.1:{port}/health")
+
+
 def test_in_background_raises_when_port_busy() -> None:
     errors: list[BaseException] = []
 

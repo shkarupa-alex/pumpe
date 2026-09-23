@@ -43,6 +43,15 @@ def test_extra_fields_affect_hash() -> None:
     assert first.pump_hash__ == EventModel.model_validate({"id": 1, "x": "v1"}).pump_hash__
 
 
+def test_equivalent_extra_mapping_order_has_same_hash() -> None:
+    first = EventModel.model_validate({"id": 1, "x": {"a": 1, "b": {"c": 2, "d": [3, 4]}}})
+    second = EventModel.model_validate({"id": 1, "x": {"b": {"d": [3, 4], "c": 2}, "a": 1}})
+    reordered_list = EventModel.model_validate({"id": 1, "x": {"a": 1, "b": {"c": 2, "d": [4, 3]}}})
+
+    assert first.pump_hash__ == second.pump_hash__
+    assert first.pump_hash__ != reordered_list.pump_hash__
+
+
 def test_naive_datetime_kept_naive() -> None:
     event = EventModel.model_validate({"id": 1, "local": datetime(2025, 1, 1, 12)})  # noqa: DTZ001
 

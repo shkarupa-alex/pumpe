@@ -30,6 +30,12 @@ class HealthServer(Server):
 
     @contextmanager
     def in_background(self) -> Generator[None]:
+        # Uvicorn keeps the previous run's flags on the instance; reset them so a re-entry waits for its own startup.
+        self.started = False
+        self.should_exit = False
+        self.force_exit = False
+        self.failure = None
+
         thread = Thread(target=self._run_in_thread)
         thread.start()
         try:

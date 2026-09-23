@@ -203,3 +203,20 @@ async def test_run_recovers_after_db_error() -> None:
         assert meta is not None
         assert meta.mode == PumpMode.FULL
         assert meta.created == 1
+
+
+@pytest.mark.asyncio
+async def test_reordered_extra_mapping_is_skipped() -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+
+        pump.records = ({"id": 1, "value": 10, "payload": {"a": 1, "b": 2}},)
+        await pump.run()
+        modified = (await load_record(session, 1)).pump_modified__
+
+        pump.records = ({"id": 1, "value": 10, "payload": {"b": 2, "a": 1}},)
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.skipped == 1
+        assert meta.updated == 0
+        assert (await load_record(session, 1)).pump_modified__ == modified

@@ -25,7 +25,7 @@ jobs:
           # setuptools-git-versioning derives the package version from tags
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
