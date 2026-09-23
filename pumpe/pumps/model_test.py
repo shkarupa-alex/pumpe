@@ -1,9 +1,11 @@
 from asyncio import sleep
 from collections.abc import AsyncGenerator
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -72,6 +74,7 @@ async def test_api_pump() -> None:
         query = select(CustomModel).order_by(CustomModel.source).limit(1)
         record = (await session.exec(query)).first()
         assert isinstance(record, CustomModel)
+        assert record.pump_hash__ is not None
         assert len(record.pump_hash__) == 64
         assert record.pump_modified__.utcoffset() == timedelta(0)
         assert full.started < record.pump_modified__ < full.started + timedelta(seconds=5)
@@ -102,3 +105,101 @@ async def test_api_pump() -> None:
         assert part.updated == 0
         assert part.deleted == 125
     await engine.dispose()
+
+
+class RecordModel(PumpModel, table=True):
+    id: int = Field(primary_key=True)
+    value: int
+    at: datetime | None = None
+
+
+class RecordModelPump(ModelPump):
+    _model: type[PumpModel] = RecordModel
+
+    records: tuple[dict[str, Any], ...] = ()
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for record in self.records:
+            yield record
+
+
+@asynccontextmanager
+async def memory_session() -> AsyncGenerator[AsyncSession]:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        yield session
+    await engine.dispose()
+
+
+async def load_record(session: AsyncSession, record_id: int) -> RecordModel:
+    session.expunge_all()
+    return (await session.exec(select(RecordModel).where(RecordModel.id == record_id))).one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [PumpMode.FULL, PumpMode.PARTIAL])
+async def test_extra_only_change_updates_record(mode: PumpMode) -> None:
+    full_interval = timedelta(0) if mode == PumpMode.FULL else timedelta(hours=1)
+    async with memory_session() as session:
+        pump = RecordModelPump(session, full_interval, timedelta(0), timedelta(0))
+
+        pump.records = ({"id": 1, "value": 10, "extra": "A"},)
+        first = await pump.run()
+        assert first is not None
+        assert first.created == 1
+
+        pump.records = ({"id": 1, "value": 10, "extra": "B"},)
+        second = await pump.run()
+        assert second is not None
+        assert second.mode == mode
+        assert second.skipped == 0
+        assert second.updated == 1
+
+        record = await load_record(session, 1)
+        assert record.pump_extra__ == {"extra": "B"}
+
+
+@pytest.mark.asyncio
+async def test_full_rescan_preserves_unchanged_modified_time() -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+
+        pump.records = ({"id": 1, "value": 10},)
+        await pump.run()
+        modified = (await load_record(session, 1)).pump_modified__
+
+        await sleep(0.05)
+        unchanged = await pump.run()
+        assert unchanged is not None
+        assert unchanged.mode == PumpMode.FULL
+        assert unchanged.skipped == 1
+        assert unchanged.updated == 0
+        assert (await load_record(session, 1)).pump_modified__ == modified
+
+        pump.records = ({"id": 1, "value": 11},)
+        changed = await pump.run()
+        assert changed is not None
+        assert changed.updated == 1
+        assert (await load_record(session, 1)).pump_modified__ > modified
+
+
+@pytest.mark.asyncio
+async def test_run_recovers_after_db_error() -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+
+        pump.records = ({"id": 1, "value": 10, "at": datetime(2025, 1, 1, 12)},)  # noqa: DTZ001
+        with pytest.raises(StatementError, match="timezone information"):
+            await pump.run()
+
+        pump.records = ({"id": 1, "value": 10, "at": datetime(2025, 1, 1, 12, tzinfo=UTC)},)
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.mode == PumpMode.FULL
+        assert meta.created == 1

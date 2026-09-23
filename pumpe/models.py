@@ -1,6 +1,6 @@
 import hashlib
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Self
 
 from pydantic import ConfigDict, field_validator, model_validator
@@ -9,7 +9,7 @@ from sqlalchemy.orm import declared_attr
 from sqlmodel import JSON, Field, SQLModel
 
 
-class PumpMode(str, Enum):
+class PumpMode(StrEnum):
     FULL = "full"
     PARTIAL = "partial"
 
@@ -40,15 +40,17 @@ class PumpModel(SQLModel):
         sa_type=JSON(none_as_null=True),
     )
 
-    model_config = ConfigDict(from_attributes=True, extra="allow")
+    # SQLModel types model_config as its private SQLModelConfig, a ConfigDict subtype.
+    model_config = ConfigDict(from_attributes=True, extra="allow")  # type: ignore[assignment]
 
-    @declared_attr
+    # Same declaration as SQLModel's own __tablename__, which SQLAlchemy's stubs do not accept.
+    @declared_attr  # type: ignore[arg-type]
     def __tablename__(self) -> str:
         return to_snake(self.__name__).removesuffix("_model")
 
     @field_validator("*", mode="before")
     @classmethod
-    def no_null_terminated(cls, value: Any) -> Any:
+    def no_null_terminated(cls, value: object) -> object:
         if not isinstance(value, str):
             return value
 
@@ -56,27 +58,25 @@ class PumpModel(SQLModel):
 
     @field_validator("*", mode="after")
     @classmethod
-    def datetime_to_utc(cls, value: Any) -> Any:
+    def datetime_to_utc(cls, value: object) -> object:
         if not isinstance(value, datetime) or value.utcoffset() is None:
             return value
 
         return value.astimezone(UTC)
 
     @model_validator(mode="after")
-    def compute_pump_hash(self) -> Self:
-        fields = self.get_custom_fields() | {"pump_extra__"}
-        dump = self.model_dump_json(include=fields).encode()
-        self.__dict__["pump_hash__"] = hashlib.sha256(dump).hexdigest()
-
-        return self
-
-    @model_validator(mode="after")
-    def compute_pump_extra(self) -> Self:
+    def compute_pump_extra_and_hash(self) -> Self:
+        # One validator, because the hash must cover the extras: separate "after" validators run in
+        # definition order, and hashing first silently skipped rows whose only change was in extras.
         extra = None
         if self.model_config.get("extra", False) and self.__pydantic_extra__:
             extra = self.__pydantic_extra__
 
         self.__dict__["pump_extra__"] = extra
+
+        fields = self.get_custom_fields() | {"pump_extra__"}
+        dump = self.model_dump_json(include=fields).encode()
+        self.__dict__["pump_hash__"] = hashlib.sha256(dump).hexdigest()
 
         return self
 
@@ -91,7 +91,7 @@ class PumpModel(SQLModel):
             field_name
             for field_name, field_info in cls.model_fields.items()
             if hasattr(field_info, "primary_key")
-            and field_info.primary_key in {True}  # workaround for wrong PydanticUndefined conversion to bool
+            and field_info.primary_key is True  # workaround for wrong PydanticUndefined conversion to bool
         ]
 
         if len(pk_fields) != 1:

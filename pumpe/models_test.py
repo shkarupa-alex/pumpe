@@ -32,6 +32,17 @@ def test_same_instant_same_hash() -> None:
     assert utc.pump_hash__ == msk.pump_hash__
 
 
+def test_extra_fields_affect_hash() -> None:
+    first = EventModel.model_validate({"id": 1, "x": "v1"})
+    second = EventModel.model_validate({"id": 1, "x": "v2"})
+    plain = EventModel.model_validate({"id": 1})
+
+    assert first.pump_extra__ == {"x": "v1"}
+    assert first.pump_hash__ != second.pump_hash__
+    assert first.pump_hash__ != plain.pump_hash__
+    assert first.pump_hash__ == EventModel.model_validate({"id": 1, "x": "v1"}).pump_hash__
+
+
 def test_naive_datetime_kept_naive() -> None:
     event = EventModel.model_validate({"id": 1, "local": datetime(2025, 1, 1, 12)})  # noqa: DTZ001
 

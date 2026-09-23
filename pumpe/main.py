@@ -14,10 +14,16 @@ async def signal_handler(scope: anyio.CancelScope) -> None:
             return
 
 
+async def run_pump_task(pump_task: Callable[[], Awaitable[None]], scope: anyio.CancelScope) -> None:
+    await pump_task()
+    # Stop waiting for signals once the pump is done, so the process exits instead of reporting healthy forever.
+    scope.cancel()
+
+
 async def main_group(pump_task: Callable[[], Awaitable[None]]) -> None:
     async with anyio.create_task_group() as tg:
         tg.start_soon(signal_handler, tg.cancel_scope)
-        tg.start_soon(pump_task)
+        tg.start_soon(run_pump_task, pump_task, tg.cancel_scope)
 
 
 def start_pump(pump_task: Callable[[], Awaitable[None]]) -> None:

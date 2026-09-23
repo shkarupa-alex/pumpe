@@ -1,11 +1,12 @@
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from logging import getLogger
 from typing import Any
 
-from aioitertools import batched as abatched
-from sqlmodel import select
+import anyio
+from aioitertools.itertools import batched as abatched
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from pumpe.models import PumpMeta, PumpMode
@@ -29,24 +30,24 @@ class BasePump(ABC):
         self.logger = getLogger("pumpe")
 
     @abstractmethod
-    async def _fetch(
+    def _fetch(
         self,
         modified_since: datetime | None,
         created_after: datetime | None,
-    ) -> AsyncGenerator[dict[str, Any]]:
-        pass
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield source records; implement as an async generator (``async def`` with ``yield``)."""
 
     async def run(self) -> PumpMeta | None:
-        meta = await self._new_meta()
-        if not meta:
-            self.logger.debug("Skip pumping: %s", self.title)
+        try:
+            meta = await self._run()
+        except BaseException:
+            # The session outlives a single run, so a failed flush must not leave it unusable for the next one.
+            with anyio.CancelScope(shield=True):
+                await self.session.rollback()
+            raise
+
+        if meta is None:
             return None
-
-        self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
-        await self._process_all(meta)
-        self.logger.debug("Finish pumping (%s): %s", meta.mode, self.title)
-
-        await self._save_meta(meta)
 
         self.logger.info(
             "Pumped (%s) %s in %.1f seconds: skipped/%d, created/%d, updated/%d, deleted/%d",
@@ -58,6 +59,20 @@ class BasePump(ABC):
             meta.updated,
             meta.deleted,
         )
+
+        return meta
+
+    async def _run(self) -> PumpMeta | None:
+        meta = await self._new_meta()
+        if not meta:
+            self.logger.debug("Skip pumping: %s", self.title)
+            return None
+
+        self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
+        await self._process_all(meta)
+        self.logger.debug("Finish pumping (%s): %s", meta.mode, self.title)
+
+        await self._save_meta(meta)
 
         return meta
 
@@ -81,7 +96,7 @@ class BasePump(ABC):
         return PumpMeta(pump=self.title, mode=mode, started=started)
 
     async def _get_last(self, mode: PumpMode) -> PumpMeta | None:
-        query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(PumpMeta.id.desc()).limit(1)
+        query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(col(PumpMeta.id).desc()).limit(1)
         if mode == PumpMode.FULL:
             query = query.where(PumpMeta.mode == mode)
 
@@ -92,7 +107,10 @@ class BasePump(ABC):
             modified_since = None
             created_after = None
         else:
-            modified_since = (await self._get_last(PumpMode.PARTIAL)).started
+            last = await self._get_last(PumpMode.PARTIAL)
+            if last is None:
+                raise RuntimeError(f"Partial pumping requires a previous run: {self.title}")
+            modified_since = last.started
             created_after = modified_since - self.past_interval
 
         generator = self._fetch(modified_since=modified_since, created_after=created_after)
@@ -101,7 +119,7 @@ class BasePump(ABC):
 
         meta.elapsed = (datetime.now(UTC) - meta.started).total_seconds()
 
-    async def _process_batch(self, batch: tuple[dict[str, Any]], meta: PumpMeta) -> None:
+    async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
         meta.skipped += len(batch)
 
     async def _save_meta(self, meta: PumpMeta) -> None:
