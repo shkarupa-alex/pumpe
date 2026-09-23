@@ -76,10 +76,16 @@ class BasePump(ABC):
         return meta
 
     async def _run(self) -> PumpMeta | None:
+        # Checked before the lease too, so polling a pump that is not due writes nothing.
+        if not await self._new_meta():
+            self.logger.debug("Skip pumping: %s", self.title)
+            return None
+
         if not await self._acquire_lease():
             self.logger.debug("Skip pumping, another run holds the lease: %s", self.title)
             return None
 
+        # Decided again under the lease: another run may have finished in between.
         meta = await self._new_meta()
         if not meta:
             self.logger.debug("Skip pumping: %s", self.title)

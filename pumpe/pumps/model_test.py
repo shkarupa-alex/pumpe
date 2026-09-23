@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import Field, SQLModel, select
+from sqlmodel import Field, SQLModel, delete, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from pumpe.models import PumpLock, PumpMeta, PumpMode, PumpModel
@@ -545,12 +545,47 @@ async def test_concurrent_first_runs_one_wins(tmp_path: Path) -> None:
             tg.start_soon(pump, session_a, gates[0])
             tg.start_soon(pump, session_b, gates[1])
 
-            # The loser returns while the winner still holds the lease at its gate.
+            # The loser returns while the winner still holds the lease: the winner's gate is still closed.
             with anyio.fail_after(5):
                 await first_done.wait()
             assert results == [None]
+            with anyio.fail_after(5):
+                while not any(g.reached.is_set() for g in gates):  # noqa: ASYNC110
+                    await anyio.sleep(0.01)
             assert sum(g.reached.is_set() for g in gates) == 1
             for gate in gates:
                 gate.opened.set()
 
         assert sorted(type(r).__name__ for r in results) == ["NoneType", "PumpMeta"]
+
+
+@pytest.mark.asyncio
+async def test_full_run_deletes_vanished_rows_after_lease_row_is_recreated() -> None:
+    async with memory_session() as session:
+        for _ in range(3):
+            await scripted_pump(session, ROW_1, ROW_2).run()
+
+        # Clearing a stuck lease by hand restarts generations below the rows' stamps.
+        await session.exec(delete(PumpLock))
+        await session.commit()
+
+        meta = await scripted_pump(session, ROW_1).run()
+        assert meta is not None
+        assert meta.deleted == 1
+        assert await record_ids(session) == {1}
+
+
+@pytest.mark.asyncio
+async def test_run_that_is_not_due_does_not_touch_the_lease() -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(hours=1), timedelta(hours=1), timedelta(0))
+        pump.records = (ROW_1,)
+        assert await pump.run() is not None
+
+        async def generation() -> int:
+            session.expunge_all()
+            return (await session.exec(select(PumpLock.generation))).one()
+
+        before = await generation()
+        assert await pump.run() is None
+        assert await generation() == before

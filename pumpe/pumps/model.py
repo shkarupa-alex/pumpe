@@ -39,10 +39,11 @@ class ModelPump(BasePump):
         if meta.mode == PumpMode.PARTIAL:
             return 0
 
-        # Every row this run fetched carries its generation; a lower one was not in this run's source.
+        # Every row this run fetched carries its generation, and runs are serialized, so any other stamp (even a
+        # higher one, left from before the pump_lock row was recreated) means the row was not in this run's source.
         await self._renew_lease()
         seen = col(self.model.pump_seen__)
-        query = delete(self.model).where(or_(seen.is_(None), seen < self._generation))
+        query = delete(self.model).where(or_(seen.is_(None), seen != self._generation))
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
