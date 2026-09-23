@@ -58,8 +58,6 @@ class BasePump(ABC):
                     self.logger.warning("Could not release the lease: %s", self.title, exc_info=True)
             raise
 
-        await self._release_lease()
-
         if meta is None:
             return None
 
@@ -84,6 +82,7 @@ class BasePump(ABC):
         meta = await self._new_meta()
         if not meta:
             self.logger.debug("Skip pumping: %s", self.title)
+            await self._release_lease()
             return None
 
         self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
@@ -145,14 +144,18 @@ class BasePump(ABC):
         if self._lease is None:
             return
 
+        await self._exec_release()
+        await self.session.commit()
+        # Cleared only once committed: an interrupted release is retried by run()'s failure handling.
+        self._lease = None
+
+    async def _exec_release(self) -> None:
         query = (
             update(PumpLock)
             .where(col(PumpLock.pump) == self.title, col(PumpLock.owner) == self._lease)
             .values(owner=None, expires=None)
         )
-        self._lease = None
         await self.session.exec(query)
-        await self.session.commit()
 
     async def _new_meta(self) -> PumpMeta | None:
         started = datetime.now(UTC)
@@ -197,7 +200,10 @@ class BasePump(ABC):
         meta.skipped += len(batch)
 
     async def _save_meta(self, meta: PumpMeta) -> None:
+        # The lease is released with the last write: a later commit would expire meta's loaded attributes.
         await self._renew_lease()
         self.session.add(meta)
+        await self._exec_release()
         await self.session.commit()
+        self._lease = None
         await self.session.refresh(meta)

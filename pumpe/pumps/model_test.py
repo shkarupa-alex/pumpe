@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from pumpe.models import PumpMeta, PumpMode, PumpModel
+from pumpe.models import PumpLock, PumpMeta, PumpMode, PumpModel
 from pumpe.pumps.model import ModelPump
 
 
@@ -402,3 +402,56 @@ async def test_stale_run_cannot_write_after_newer_run_takes_over(
         session_a.expunge_all()
         rows = (await session_a.exec(select(RecordModel))).all()
         assert {r.id: r.value for r in rows} == expected
+
+
+async def lease_owner(session: AsyncSession) -> str | None:
+    session.expunge_all()
+    return (await session.exec(select(PumpLock.owner).where(PumpLock.pump == RecordModel.__name__))).one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expire_on_commit", [True, False])
+async def test_run_with_expiring_session(*, expire_on_commit: bool) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=expire_on_commit) as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = (ROW_1,)
+
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.id is not None
+        assert meta.mode == PumpMode.FULL
+        assert meta.created == 1
+        assert meta.elapsed is not None
+        assert await record_ids(session) == {1}
+        assert await lease_owner(session) is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_final_commit_does_not_orphan_lease(tmp_path: Path) -> None:
+    async with file_sessions(tmp_path) as (session_a, session_b):
+        gate = Gate()
+        pump = scripted_pump(session_a, ROW_1)
+        commit = session_a.commit
+
+        async def gated_commit() -> None:
+            if not gate.reached.is_set() and any(isinstance(o, PumpMeta) for o in session_a.identity_map.values()):
+                # Hold the last transaction open: meta and the lease release written, not yet committed.
+                gate.reached.set()
+                await gate.opened.wait()
+            await commit()
+
+        session_a.commit = gated_commit  # type: ignore[method-assign]
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump.run)
+            await gate.reached.wait()
+            tg.cancel_scope.cancel()
+
+        assert await lease_owner(session_b) is None
+        after = await scripted_pump(session_b, ROW_1).run()
+        assert after is not None
+        assert after.mode == PumpMode.FULL
