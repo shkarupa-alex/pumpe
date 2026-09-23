@@ -748,3 +748,70 @@ async def test_same_instance_overlapping_run_does_not_take_over() -> None:
         again = await pump.run()
         assert again is not None
         assert again.skipped == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_mode", [PumpMode.FULL, PumpMode.PARTIAL])
+async def test_stale_run_cannot_delete_or_save_after_its_last_batch(tmp_path: Path, stale_mode: PumpMode) -> None:
+    async with file_sessions(tmp_path) as (session_a, session_b):
+        await seed_records(session_a, ROW_1)
+
+        # The stale run commits its last batch, then stalls past its lease before deleting and saving.
+        gate = Gate()
+        stale = scripted_pump(session_b, ROW_1, gate)
+        stale.lease_timeout = timedelta(0)
+        if stale_mode == PumpMode.PARTIAL:
+            stale.full_interval = timedelta(hours=1)
+        results: list[PumpMeta | BaseException | None] = []
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump_in_background, stale, results)
+            with anyio.fail_after(5):
+                await gate.reached.wait()
+
+            newer = await scripted_pump(session_a, ROW_1_NEWER, ROW_2).run()
+            assert newer is not None
+            assert newer.mode == PumpMode.FULL
+            gate.opened.set()
+
+        [error] = results
+        assert isinstance(error, RuntimeError)
+        assert "lease lost" in str(error)
+        assert await record_ids(session_a) == {1, 2}
+        metas = (await session_a.exec(select(PumpMeta).where(PumpMeta.pump == RecordModel.__name__))).all()
+        assert len(metas) == 2
+
+
+class LateLeasePump(ScriptedRecordPump):
+    lease_gate: Gate
+
+    async def _acquire_lease(self) -> bool:
+        self.lease_gate.reached.set()
+        await self.lease_gate.opened.wait()
+        return await super()._acquire_lease()
+
+
+@pytest.mark.asyncio
+async def test_run_rechecks_schedule_under_the_lease(tmp_path: Path) -> None:
+    async with file_sessions(tmp_path) as (session_a, session_b):
+        # Due before the lease, but another run completes the work before this one gets the lease.
+        late = LateLeasePump(session_b, timedelta(hours=1), timedelta(hours=1), timedelta(0))
+        late.script = (ROW_1,)
+        late.lease_gate = Gate()
+        results: list[PumpMeta | BaseException | None] = []
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump_in_background, late, results)
+            with anyio.fail_after(5):
+                await late.lease_gate.reached.wait()
+
+            first = await scripted_pump(session_a, ROW_1).run()
+            assert first is not None
+            assert first.mode == PumpMode.FULL
+            late.lease_gate.opened.set()
+
+        assert results == [None]
+        session_a.expunge_all()
+        metas = (await session_a.exec(select(PumpMeta).where(PumpMeta.pump == RecordModel.__name__))).all()
+        assert len(metas) == 1
+        assert await lease_owner(session_a) is None
