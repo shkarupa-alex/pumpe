@@ -56,13 +56,14 @@ class ModelPump(BasePump):
             raise ValueError(f"Source records must carry the primary key: {self.title}")
         items = {self.id(i): i for i in validated}
 
-        query_exist = select(self.model).where(self.id(self.model).in_(items))
-        existing = (await self.session.exec(query_exist)).all()
+        # Stored hashes as plain values, not row objects: an object that stays in the session's identity map is not
+        # reloaded by a select, and the bulk writes below never update it, so its hash could be stale.
+        key = self.id(self.model)
+        query_exist = select(key, col(self.model.pump_hash__)).where(key.in_(items))
+        stored = dict((await self.session.exec(query_exist)).all())
 
-        unchanged = {
-            self.id(e): items.pop(self.id(e)) for e in existing if items[self.id(e)].pump_hash__ == e.pump_hash__
-        }
-        changed = {self.id(e): items.pop(self.id(e)) for e in existing if self.id(e) not in unchanged}
+        unchanged = {k: items.pop(k) for k, stored_hash in stored.items() if items[k].pump_hash__ == stored_hash}
+        changed = {k: items.pop(k) for k in stored if k not in unchanged}
 
         meta.skipped += len(unchanged)
         meta.created += len(items)

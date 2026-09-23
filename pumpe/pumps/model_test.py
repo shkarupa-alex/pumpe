@@ -940,3 +940,31 @@ async def test_unrelated_sqlite_writer_does_not_silently_skip_due_run(tmp_path: 
         meta = await pump.run()
         assert meta is not None
         assert meta.created == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("third", "updated"), [(1, 1), (2, 0)])
+async def test_partial_run_compares_persisted_hash_with_retained_identity(third: int, updated: int) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        pump = RecordModelPump(session, timedelta(hours=1), timedelta(0), timedelta(0))
+        pump.records = ({"id": 1, "value": 1},)
+        assert await pump.run() is not None
+
+        # The caller keeps a loaded row in the session while later runs rewrite it in bulk.
+        retained = (await session.exec(select(RecordModel).where(RecordModel.id == 1))).one()
+
+        pump.records = ({"id": 1, "value": 2},)
+        second = await pump.run()
+        assert second is not None
+        assert (second.mode, second.updated) == (PumpMode.PARTIAL, 1)
+
+        pump.records = ({"id": 1, "value": third},)
+        last = await pump.run()
+        assert last is not None
+        assert (last.mode, last.updated, last.skipped) == (PumpMode.PARTIAL, updated, 1 - updated)
+        assert (await session.exec(select(RecordModel.value).where(RecordModel.id == 1))).one() == third
+        assert retained.id == 1
+    await engine.dispose()
