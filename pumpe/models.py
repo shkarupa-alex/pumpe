@@ -6,6 +6,7 @@ from typing import Any, Self
 
 from pydantic import ConfigDict, field_validator, model_validator
 from pydantic.alias_generators import to_snake
+from pydantic_core import to_jsonable_python
 from sqlalchemy.orm import declared_attr
 from sqlmodel import JSON, Field, SQLModel
 
@@ -86,7 +87,8 @@ class PumpModel(SQLModel):
         if self.model_config.get("extra", False) and self.__pydantic_extra__:
             extra = self.__pydantic_extra__
 
-        self.__dict__["pump_extra__"] = extra
+        # Stored as JSON: the column cannot serialize datetimes, decimals and the like, which extras keep as given.
+        self.__dict__["pump_extra__"] = None if extra is None else to_jsonable_python(extra)
 
         # Sorted keys: sources may reorder JSON objects between fetches without changing their content.
         fields = self.get_custom_fields() | {"pump_extra__"}

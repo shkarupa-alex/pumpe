@@ -1,4 +1,6 @@
 from datetime import UTC, datetime, timedelta, timezone
+from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from pydantic import NaiveDatetime
@@ -50,6 +52,16 @@ def test_equivalent_extra_mapping_order_has_same_hash() -> None:
 
     assert first.pump_hash__ == second.pump_hash__
     assert first.pump_hash__ != reordered_list.pump_hash__
+
+
+def test_extra_values_are_json_compatible() -> None:
+    typed = EventModel.model_validate(
+        {"id": 1, "when": datetime(2025, 1, 1, tzinfo=UTC), "amount": Decimal("1.5"), "ref": UUID(int=1)},
+    )
+    plain = {"when": "2025-01-01T00:00:00Z", "amount": "1.5", "ref": "00000000-0000-0000-0000-000000000001"}
+
+    assert typed.pump_extra__ == plain
+    assert typed.pump_hash__ == EventModel.model_validate({"id": 1, **plain}).pump_hash__
 
 
 def test_naive_datetime_kept_naive() -> None:

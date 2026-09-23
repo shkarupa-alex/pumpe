@@ -4,8 +4,10 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import anyio
 import pytest
@@ -420,6 +422,7 @@ async def test_run_with_expiring_session(*, expire_on_commit: bool) -> None:
         pump.records = (ROW_1,)
 
         meta = await pump.run()
+        assert not session.in_transaction()
         assert meta is not None
         assert meta.id is not None
         assert meta.mode == PumpMode.FULL
@@ -587,5 +590,31 @@ async def test_run_that_is_not_due_does_not_touch_the_lease() -> None:
             return (await session.exec(select(PumpLock.generation))).one()
 
         before = await generation()
+        await session.commit()
         assert await pump.run() is None
+        assert not session.in_transaction()
         assert await generation() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [
+        (datetime(2025, 1, 1, tzinfo=UTC), "2025-01-01T00:00:00Z"),
+        (Decimal("1.5"), "1.5"),
+        (UUID(int=1), "00000000-0000-0000-0000-000000000001"),
+    ],
+)
+async def test_non_json_extras_are_stored(value: object, stored: str) -> None:
+    async with memory_session() as session:
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = ({"id": 1, "value": 10, "x": value},)
+
+        first = await pump.run()
+        assert first is not None
+        assert first.created == 1
+        assert (await load_record(session, 1)).pump_extra__ == {"x": stored}
+
+        second = await pump.run()
+        assert second is not None
+        assert (second.skipped, second.updated) == (1, 0)

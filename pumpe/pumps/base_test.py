@@ -47,6 +47,7 @@ async def test_api_pump() -> None:
         )
 
         full = await pump.run()
+        assert not session.in_transaction()
         assert isinstance(full, PumpMeta)
         assert full.mode == PumpMode.FULL
         assert full.started.utcoffset() == timedelta(0)
@@ -57,6 +58,7 @@ async def test_api_pump() -> None:
 
         skip = await pump.run()
         assert skip is None
+        assert not session.in_transaction()
 
         await sleep(2)
         part = await pump.run()
@@ -141,3 +143,36 @@ async def test_custom_batch_is_fenced_by_the_lease(tmp_path: Path, *, lease_expi
         else:
             assert isinstance(older_result, PumpMeta)
             assert await written_value(session_b) == 10
+
+
+class SlowPump(BasePump):
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for i in range(8):
+            await anyio.sleep(0.1)
+            yield {"i": i}
+
+
+@pytest.mark.asyncio
+async def test_base_pump_keeps_lease_between_batches(tmp_path: Path) -> None:
+    async with file_sessions(tmp_path) as (session_a, session_b):
+        # Every pause between batches stays well below the lease timeout, though the whole run exceeds it.
+        slow = SlowPump(session_a, timedelta(0), timedelta(0), timedelta(0), batch_size=1)
+        slow.lease_timeout = timedelta(seconds=0.3)
+        results: list[PumpMeta | None] = []
+
+        async def run_slow() -> None:
+            results.append(await slow.run())
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_slow)
+            await anyio.sleep(0.5)
+            assert await SlowPump(session_b, timedelta(0), timedelta(0), timedelta(0)).run() is None
+
+        [meta] = results
+        assert meta is not None
+        assert meta.mode == PumpMode.FULL
+        assert meta.skipped == 8

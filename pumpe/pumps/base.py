@@ -79,6 +79,7 @@ class BasePump(ABC):
         # Checked before the lease too, so polling a pump that is not due writes nothing.
         if not await self._new_meta():
             self.logger.debug("Skip pumping: %s", self.title)
+            await self.session.commit()
             return None
 
         if not await self._acquire_lease():
@@ -230,3 +231,7 @@ class BasePump(ABC):
         await self.session.commit()
         self._lease = None
         await self.session.refresh(meta)
+        # End the refresh's transaction too, so the session does not idle inside one until the next run;
+        # expunged first, meta keeps its loaded attributes whatever expire_on_commit is.
+        self.session.expunge(meta)
+        await self.session.commit()
