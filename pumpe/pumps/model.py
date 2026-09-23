@@ -64,7 +64,6 @@ class ModelPump(BasePump):
         meta.created += len(items)
         meta.updated += len(changed)
 
-        await self._renew_lease()
         if unchanged:
             query_seen = (
                 update(self.model)
@@ -75,7 +74,6 @@ class ModelPump(BasePump):
 
         await self._process_insert(items.values())
         await self._process_update(changed.values())
-        await self.session.commit()
 
     @property
     def _keep_modified(self) -> dict[str, Any]:

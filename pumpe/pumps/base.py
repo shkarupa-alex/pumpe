@@ -211,11 +211,15 @@ class BasePump(ABC):
 
         generator = self._fetch(modified_since=modified_since, created_after=created_after)
         async for batch in abatched(generator, self.batch_size):
+            # One fenced transaction per batch: a run that has lost its lease cannot commit a stale batch.
+            await self._renew_lease()
             await self._process_batch(batch, meta)
+            await self.session.commit()
 
         meta.elapsed = (datetime.now(UTC) - meta.started).total_seconds()
 
     async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
+        """Write one batch inside the transaction the caller fences and commits; do not commit here."""
         meta.skipped += len(batch)
 
     async def _save_meta(self, meta: PumpMeta) -> None:
