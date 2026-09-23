@@ -85,7 +85,7 @@ async def test_api_pump() -> None:
         assert len(record.pump_hash__) == 64
         assert record.pump_modified__.utcoffset() == timedelta(0)
         assert full.started < record.pump_modified__ < full.started + timedelta(seconds=5)
-        assert record.pump_seen__ == 1
+        assert record.pump_seen__ is not None
         assert record.pump_extra__ == {"field3": "extra"}
         assert record.source == "source_0"
         assert record.field1 == 0
@@ -460,18 +460,20 @@ async def test_cancel_during_final_commit_does_not_orphan_lease(tmp_path: Path) 
         assert after.mode == PumpMode.FULL
 
 
-def fail_once(session: AsyncSession, prefix: str) -> None:
+def fail_lease_release_once(session: AsyncSession) -> None:
     failed: list[str] = []
 
     def hook(  # noqa: PLR0913, PLR0917
         conn: object,  # noqa: ARG001
         cursor: object,  # noqa: ARG001
         statement: str,
-        parameters: object,  # noqa: ARG001
+        parameters: object,
         context: object,  # noqa: ARG001
         executemany: bool,  # noqa: ARG001, FBT001
     ) -> None:
-        if not failed and statement.startswith(prefix):
+        # The release clears the owner; taking the lease runs the same statement with a token.
+        releasing = isinstance(parameters, tuple) and parameters[:1] == (None,)
+        if not failed and statement.startswith("UPDATE pump_lock SET owner=?, expires=? WHERE") and releasing:
             failed.append(statement)
             raise OperationalError(statement, None, Exception("injected failure"))
 
@@ -483,7 +485,7 @@ def fail_once(session: AsyncSession, prefix: str) -> None:
 @pytest.mark.parametrize("source_fails", [False, True])
 async def test_failed_release_keeps_pump_usable(*, source_fails: bool) -> None:
     async with memory_session() as session:
-        fail_once(session, "UPDATE pump_lock SET owner=?, expires=? WHERE")
+        fail_lease_release_once(session)
 
         first = scripted_pump(session, ValueError("source") if source_fails else ROW_1)
         with pytest.raises(ValueError if source_fails else OperationalError):
@@ -563,12 +565,13 @@ async def test_concurrent_first_runs_one_wins(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_run_deletes_vanished_rows_after_lease_row_is_recreated() -> None:
+@pytest.mark.parametrize("earlier_runs", [1, 3])
+async def test_full_run_deletes_vanished_rows_after_lease_row_is_recreated(earlier_runs: int) -> None:
     async with memory_session() as session:
-        for _ in range(3):
+        for _ in range(earlier_runs):
             await scripted_pump(session, ROW_1, ROW_2).run()
 
-        # Clearing a stuck lease by hand restarts generations below the rows' stamps.
+        # Clearing a stuck lease by hand must not let a new run mistake old stamps for its own.
         await session.exec(delete(PumpLock))
         await session.commit()
 
@@ -579,21 +582,31 @@ async def test_full_run_deletes_vanished_rows_after_lease_row_is_recreated() -> 
 
 
 @pytest.mark.asyncio
-async def test_run_that_is_not_due_does_not_touch_the_lease() -> None:
+async def test_run_that_is_not_due_writes_nothing() -> None:
     async with memory_session() as session:
         pump = RecordModelPump(session, timedelta(hours=1), timedelta(hours=1), timedelta(0))
         pump.records = (ROW_1,)
         assert await pump.run() is not None
 
-        async def generation() -> int:
-            session.expunge_all()
-            return (await session.exec(select(PumpLock.generation))).one()
+        writes: list[str] = []
 
-        before = await generation()
-        await session.commit()
+        def record_write(  # noqa: PLR0913, PLR0917
+            conn: object,  # noqa: ARG001
+            cursor: object,  # noqa: ARG001
+            statement: str,
+            parameters: object,  # noqa: ARG001
+            context: object,  # noqa: ARG001
+            executemany: bool,  # noqa: ARG001, FBT001
+        ) -> None:
+            if not statement.lstrip().upper().startswith("SELECT"):
+                writes.append(statement)
+
+        assert session.bind is not None
+        event.listen(session.bind.sync_engine, "before_cursor_execute", record_write)
+
         assert await pump.run() is None
         assert not session.in_transaction()
-        assert await generation() == before
+        assert writes == []
 
 
 @pytest.mark.asyncio

@@ -39,11 +39,11 @@ class ModelPump(BasePump):
         if meta.mode == PumpMode.PARTIAL:
             return 0
 
-        # Every row this run fetched carries its generation, and runs are serialized, so any other stamp (even a
-        # higher one, left from before the pump_lock row was recreated) means the row was not in this run's source.
+        # Every row this run fetched carries its token, and runs are serialized, so any other stamp means the row
+        # was not in this run's source.
         await self._renew_lease()
         seen = col(self.model.pump_seen__)
-        query = delete(self.model).where(or_(seen.is_(None), seen != self._generation))
+        query = delete(self.model).where(or_(seen.is_(None), seen != self._run_token))
         deleted = (await self.session.exec(query)).rowcount
         await self.session.commit()
 
@@ -67,7 +67,7 @@ class ModelPump(BasePump):
         if unchanged:
             query_seen = (
                 update(self.model)
-                .values(pump_seen__=self._generation, **self._keep_modified)
+                .values(pump_seen__=self._run_token, **self._keep_modified)
                 .where(self.id(self.model).in_(unchanged))
             )
             await self.session.exec(query_seen)
@@ -81,9 +81,9 @@ class ModelPump(BasePump):
         return {"pump_modified__": self.model.pump_modified__}
 
     async def _process_insert(self, items: Iterable[PumpModel]) -> None:
-        mappings = [dict(i) | {"pump_seen__": self._generation} for i in items]
+        mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]
         await self.session.run_sync(lambda s: s.bulk_insert_mappings(self.model, mappings))
 
     async def _process_update(self, items: Iterable[PumpModel]) -> None:
-        mappings = [dict(i) | {"pump_seen__": self._generation} for i in items]
+        mappings = [dict(i) | {"pump_seen__": self._run_token} for i in items]
         await self.session.run_sync(lambda s: s.bulk_update_mappings(self.model, mappings))

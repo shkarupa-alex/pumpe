@@ -32,7 +32,6 @@ class BasePump(ABC):
         self.past_interval = past_interval
         self.batch_size = batch_size
         self._lease: str | None = None
-        self._generation = 0
 
         self.logger = getLogger("pumpe")
 
@@ -119,7 +118,7 @@ class BasePump(ABC):
         takeover = (
             update(PumpLock)
             .where(col(PumpLock.pump) == self.title, free)
-            .values(owner=owner, expires=now + self.lease_timeout, generation=col(PumpLock.generation) + 1)
+            .values(owner=owner, expires=now + self.lease_timeout)
         )
 
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
@@ -129,8 +128,6 @@ class BasePump(ABC):
             await self.session.rollback()
             return False
 
-        query = select(PumpLock.generation).where(PumpLock.pump == self.title)
-        self._generation = (await self.session.exec(query)).one()
         await self.session.commit()
         return True
 
@@ -148,6 +145,13 @@ class BasePump(ABC):
             await self.session.commit()
         except IntegrityError:
             await self.session.rollback()
+
+    @property
+    def _run_token(self) -> str:
+        """The current run's lease token, unique per run."""
+        if self._lease is None:
+            raise RuntimeError(f"Pump holds no lease: {self.title}")
+        return self._lease
 
     async def _renew_lease(self) -> None:
         """Fence the current transaction: call it before the first write of every transaction a run commits."""

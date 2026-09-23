@@ -38,8 +38,6 @@ class PumpLock(SQLModel, table=True):
     pump: str = Field(primary_key=True)
     owner: str | None = None
     expires: datetime | None = None
-    # Incremented by every run that takes the lease, so later runs always have larger generations.
-    generation: int = 0
 
 
 class PumpModel(SQLModel):
@@ -48,8 +46,8 @@ class PumpModel(SQLModel):
         default_factory=lambda: datetime.now(UTC),
         sa_column_kwargs={"onupdate": lambda: datetime.now(UTC)},
     )
-    # Lease generation of the latest run that fetched the row.
-    pump_seen__: int | None = None
+    # Lease token of the latest run that fetched the row: unique per run, even if pump_lock is recreated.
+    pump_seen__: str | None = None
     pump_extra__: dict[str, Any] | None = Field(
         default=None,
         sa_type=JSON(none_as_null=True),
