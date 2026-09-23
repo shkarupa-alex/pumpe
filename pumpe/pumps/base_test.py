@@ -15,6 +15,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from pumpe.models import PumpLock, PumpMeta, PumpMode
 from pumpe.pumps.base import BasePump, lock_contended
 from pumpe.pumps.model_test import (
+    FRACTIONAL_DATETIME,
     ROW_1,
     Gate,
     RecordModel,
@@ -332,3 +333,66 @@ async def test_contended_takeover_raises_on_sqlite(error: type[DBAPIError], orig
         with pytest.raises(error):
             await scripted_pump(session, ROW_1).run()
         assert await lease_owner(session) == "other"
+
+
+def round_stored_fractions(parameters: object) -> object:
+    """Round datetime parameters half up to whole seconds, the way MySQL stores them in a DATETIME."""
+    if isinstance(parameters, list):
+        return [round_stored_fractions(p) for p in parameters]
+    if not isinstance(parameters, tuple):
+        return parameters
+    rounded = []
+    for p in parameters:
+        if isinstance(p, str) and FRACTIONAL_DATETIME.match(p):
+            value = datetime.fromisoformat(p)
+            value = value.replace(microsecond=0) + timedelta(seconds=value.microsecond >= 500_000)
+            p = value.isoformat(sep=" ", timespec="microseconds")  # noqa: PLW2901
+        rounded.append(p)
+    return tuple(rounded)
+
+
+class WatermarkPump(BasePump):
+    fetches: list[tuple[datetime | None, datetime]]
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        self.fetches.append((modified_since, datetime.now(UTC)))
+        yield {"id": 1}
+
+
+@pytest.mark.asyncio
+async def test_partial_watermark_not_after_previous_fetch_on_rounding_storage() -> None:
+    async with memory_session() as session:
+
+        def round_up(  # noqa: PLR0913, PLR0917
+            conn: object,  # noqa: ARG001
+            cursor: object,  # noqa: ARG001
+            statement: str,
+            parameters: object,
+            context: object,  # noqa: ARG001
+            executemany: bool,  # noqa: ARG001, FBT001
+        ) -> tuple[str, object]:
+            if statement.lstrip().upper().startswith(("INSERT", "UPDATE")):
+                parameters = round_stored_fractions(parameters)
+            return statement, parameters
+
+        assert session.bind is not None
+        event.listen(session.bind.sync_engine, "before_cursor_execute", round_up, retval=True)
+
+        pump = WatermarkPump(session, timedelta(hours=1), timedelta(0), timedelta(0))
+        pump.fetches = []
+        # Late in a second, where rounding would move a fractional start into the next one.
+        await anyio.sleep(max(0, 600_000 - datetime.now(UTC).microsecond) / 1_000_000)
+
+        full = await pump.run()
+        partial = await pump.run()
+        assert full is not None
+        assert partial is not None
+        assert (full.mode, partial.mode) == (PumpMode.FULL, PumpMode.PARTIAL)
+        assert full.started.microsecond == 0
+        [(_, full_fetched), (modified_since, _)] = pump.fetches
+        assert modified_since is not None
+        assert modified_since <= full_fetched

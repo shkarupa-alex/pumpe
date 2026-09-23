@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from logging import getLogger
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
@@ -128,7 +129,10 @@ class BasePump(ABC):
             return None
 
         self.logger.debug("Start pumping (%s): %s", meta.mode, self.title)
+        began = monotonic()
         await self._process_all(meta)
+        # Measured around every step of _process_all, including what subclasses do after the batches.
+        meta.elapsed = monotonic() - began
         self.logger.debug("Finish pumping (%s): %s", meta.mode, self.title)
 
         await self._save_meta(meta)
@@ -263,19 +267,21 @@ class BasePump(ABC):
         self._unreleased.clear()
 
     async def _new_meta(self) -> PumpMeta | None:
-        started = datetime.now(UTC)
+        now = datetime.now(UTC)
 
         last_full = await self._get_last(PumpMode.FULL)
         last_part = await self._get_last(PumpMode.PARTIAL)
 
-        if not last_full or last_full.started + self.full_interval < started:
+        if not last_full or last_full.started + self.full_interval < now:
             mode = PumpMode.FULL
-        elif last_part and last_part.started + self.part_interval < started:
+        elif last_part and last_part.started + self.part_interval < now:
             mode = PumpMode.PARTIAL
         else:
             return None
 
-        return PumpMeta(pump=self.title, mode=mode, started=started)
+        # Stored in whole seconds, which every DATETIME keeps exactly: MySQL rounds fractions up, and a start stored
+        # later than this run began fetching would make the next partial run skip changes made in between.
+        return PumpMeta(pump=self.title, mode=mode, started=now.replace(microsecond=0))
 
     async def _get_last(self, mode: PumpMode) -> PumpMeta | None:
         query = select(PumpMeta).where(PumpMeta.pump == self.title).order_by(col(PumpMeta.id).desc()).limit(1)
@@ -303,8 +309,6 @@ class BasePump(ABC):
             await self._renew_lease()
             await self._process_batch(batch, meta)
             await self.session.commit()
-
-        meta.elapsed = (datetime.now(UTC) - meta.started).total_seconds()
 
     async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
         """Write one batch inside the transaction the caller fences and commits; do not commit here."""

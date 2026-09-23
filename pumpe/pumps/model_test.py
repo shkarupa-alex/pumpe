@@ -1,4 +1,5 @@
 import re
+import time
 from asyncio import sleep
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -11,7 +12,7 @@ from uuid import UUID
 
 import anyio
 import pytest
-from sqlalchemy import Column, Integer, event, text
+from sqlalchemy import Column, Integer, String, event, text
 from sqlalchemy.exc import OperationalError, StatementError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Field, SQLModel, delete, select
@@ -968,3 +969,74 @@ async def test_partial_run_compares_persisted_hash_with_retained_identity(third:
         assert (await session.exec(select(RecordModel.value).where(RecordModel.id == 1))).one() == third
         assert retained.id == 1
     await engine.dispose()
+
+
+class NocaseModel(PumpModel, table=True):
+    code: str = Field(primary_key=True, sa_type=String(collation="NOCASE"))
+    value: int
+
+
+class NocasePump(ModelPump):
+    _model: type[PumpModel] = NocaseModel
+
+    records: tuple[dict[str, Any], ...] = ()
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for record in self.records:
+            yield record
+
+
+@pytest.mark.asyncio
+async def test_key_equal_only_under_collation_is_reported() -> None:
+    async with memory_session() as session:
+        pump = NocasePump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = ({"code": "abc", "value": 1},)
+        first = await pump.run()
+        assert first is not None
+        assert first.created == 1
+
+        pump.records = ({"code": "ABC", "value": 1},)
+        with pytest.raises(ValueError, match=r"Stored keys \['abc'\] match source keys only under the key's collation"):
+            await pump.run()
+
+        # Nothing was written, and the pump stays usable.
+        assert (await session.exec(select(NocaseModel.code))).all() == ["abc"]
+        pump.records = ({"code": "abc", "value": 2},)
+        last = await pump.run()
+        assert last is not None
+        assert last.updated == 1
+
+
+@pytest.mark.asyncio
+async def test_elapsed_includes_deletion() -> None:
+    async with memory_session() as session:
+
+        def slow_delete(  # noqa: PLR0913, PLR0917
+            conn: object,  # noqa: ARG001
+            cursor: object,  # noqa: ARG001
+            statement: str,
+            parameters: object,  # noqa: ARG001
+            context: object,  # noqa: ARG001
+            executemany: bool,  # noqa: ARG001, FBT001
+        ) -> None:
+            if statement.startswith("DELETE FROM record "):
+                time.sleep(0.5)
+
+        assert session.bind is not None
+        event.listen(session.bind.sync_engine, "before_cursor_execute", slow_delete)
+
+        pump = RecordModelPump(session, timedelta(0), timedelta(0), timedelta(0))
+        pump.records = (ROW_1,)
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.elapsed is not None
+        assert meta.elapsed >= 0.5
+
+        session.expunge_all()
+        stored = (await session.exec(select(PumpMeta.elapsed).where(PumpMeta.id == meta.id))).one()
+        assert stored is not None
+        assert stored >= 0.5

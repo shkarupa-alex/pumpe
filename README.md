@@ -12,6 +12,13 @@ Pass aware values to `datetime` fields: they are normalized to UTC, and naive va
 Annotate a field with pydantic's `NaiveDatetime` to store naive values as they are.
 `_fetch` receives `modified_since` and `created_after` as aware UTC datetimes.
 
+## Primary keys
+
+Source records must carry the model's primary key, and rows are matched by it as Python values.
+If the source can send string keys that differ only in case, accents or trailing spaces, give the key column a binary
+collation (MySQL/MariaDB compare strings case-insensitively by default); otherwise such a record fails the run with
+`ValueError`.
+
 ## Concurrent runs
 
 One run of a pump writes at a time, across sessions and processes: a run takes a lease in the `pump_lock` table,

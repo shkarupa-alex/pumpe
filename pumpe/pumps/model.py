@@ -61,6 +61,11 @@ class ModelPump(BasePump):
         key = self.id(self.model)
         query_exist = select(key, col(self.model.pump_hash__)).where(key.in_(items))
         stored = dict((await self.session.exec(query_exist)).all())
+        if collated := stored.keys() - items.keys():
+            # The database matched these under the key column's collation (case, accents, trailing spaces), and
+            # rewriting a stored key to another spelling is not this pump's call to make.
+            message = f"Stored keys {sorted(map(str, collated))} match source keys only under the key's collation"
+            raise ValueError(f"{message}, give the key a binary collation: {self.title}")
 
         unchanged = {k: items.pop(k) for k, stored_hash in stored.items() if items[k].pump_hash__ == stored_hash}
         changed = {k: items.pop(k) for k in stored if k not in unchanged}
