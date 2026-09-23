@@ -124,10 +124,25 @@ class BasePump(ABC):
         # so runs are serialized; an expired lease is taken over, as its holder is presumed dead.
         await self._ensure_lease_row()
 
-        owner = uuid4().hex
         now = datetime.now(UTC)
         if self._lease is not None:
             self._unreleased.add(self._lease)
+        # Read without locking first: the holder keeps the row locked through each of its write transactions, and
+        # a takeover update would wait on that lock (InnoDB, SQLite) and time out instead of skipping.
+        query = select(PumpLock.owner, PumpLock.expires).where(PumpLock.pump == self.title)
+        row = (await self.session.exec(query)).first()
+        await self.session.commit()
+        if row is None:
+            # Deleted by hand since it was ensured; the next run creates it again.
+            self._forget_lease()
+            return False
+        holder, expires = row
+        if holder is not None and holder not in self._unreleased and (expires is None or expires >= now):
+            # A single row holds a single token, so none of this instance's own is left to release.
+            self._forget_lease()
+            return False
+
+        owner = uuid4().hex
         free = or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now)
         if self._unreleased:
             # This instance's own leases, left behind by a release or takeover that failed.
@@ -138,9 +153,11 @@ class BasePump(ABC):
             .values(owner=owner, expires=now + self.lease_timeout)
         )
 
+        taken = (await self.session.exec(takeover)).rowcount == 1
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
+        # A takeover that failed to execute wrote nothing, so there is no new token to release.
         self._lease = owner
-        if (await self.session.exec(takeover)).rowcount != 1:
+        if not taken:
             # Not even one of the unreleased tokens is in pump_lock, or the update would have matched it.
             await self.session.rollback()
             self._forget_lease()

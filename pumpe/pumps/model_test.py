@@ -299,8 +299,8 @@ class ScriptedRecordPump(RecordModelPump):
 
 
 @asynccontextmanager
-async def file_sessions(path: Path) -> AsyncGenerator[tuple[AsyncSession, AsyncSession]]:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path / 'pump.sqlite'}")
+async def file_sessions(path: Path, busy_timeout: float = 5) -> AsyncGenerator[tuple[AsyncSession, AsyncSession]]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path / 'pump.sqlite'}", connect_args={"timeout": busy_timeout})
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     async with (
@@ -856,3 +856,41 @@ async def test_explicit_null_survives_server_default_and_rerun(value: int | None
         assert second is not None
         assert (second.skipped, second.updated) == (1, 0)
         assert await stored() == value
+
+
+class WritingHoldPump(ScriptedRecordPump):
+    gate: Gate
+
+    async def _process_batch(self, batch: tuple[dict[str, Any], ...], meta: PumpMeta) -> None:
+        await super()._process_batch(batch, meta)
+        # Paused inside the fenced write transaction, which keeps the lease row locked.
+        self.gate.reached.set()
+        await self.gate.opened.wait()
+
+
+@pytest.mark.asyncio
+async def test_competing_run_skips_while_holder_is_writing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    async with file_sessions(tmp_path, busy_timeout=1) as (session_a, session_b):
+        await seed_records(session_a, ROW_2)
+        await session_a.commit()
+
+        holder = WritingHoldPump(session_a, timedelta(0), timedelta(0), timedelta(0), batch_size=1)
+        holder.script = (ROW_1,)
+        holder.gate = Gate()
+        results: list[PumpMeta | BaseException | None] = []
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(pump_in_background, holder, results)
+            await holder.gate.reached.wait()
+
+            started = anyio.current_time()
+            try:
+                assert await scripted_pump(session_b, ROW_1).run() is None
+            finally:
+                holder.gate.opened.set()
+            # Well below the one-second busy timeout: the competitor never waited on the holder's lock.
+            assert anyio.current_time() - started < 0.5
+
+        assert isinstance(results[0], PumpMeta)
+        assert results[0].created == 1
+        assert await lease_owner(session_a) is None
+        assert "Could not release the lease" not in caplog.text
