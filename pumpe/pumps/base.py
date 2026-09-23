@@ -205,7 +205,7 @@ class BasePump(ABC):
     @property
     def _locks_rows(self) -> bool:
         """Whether the database locks single rows, so a wait on the lease row means another transaction holds it."""
-        return self.session.get_bind().dialect.name != "sqlite"
+        return self.session.get_bind(PumpLock).dialect.name != "sqlite"
 
     async def _ensure_lease_row(self) -> None:
         query = select(PumpLock.pump).where(PumpLock.pump == self.title)
