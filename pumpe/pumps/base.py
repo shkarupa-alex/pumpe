@@ -32,6 +32,8 @@ class BasePump(ABC):
         self.past_interval = past_interval
         self.batch_size = batch_size
         self._lease: str | None = None
+        # Tokens of earlier runs that a failed release or takeover may have left in pump_lock.
+        self._unreleased: set[str] = set()
 
         self.logger = getLogger("pumpe")
 
@@ -111,10 +113,12 @@ class BasePump(ABC):
 
         owner = uuid4().hex
         now = datetime.now(UTC)
-        free = or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now)
         if self._lease is not None:
-            # This instance's own lease, left behind by a release that failed.
-            free = or_(free, col(PumpLock.owner) == self._lease)
+            self._unreleased.add(self._lease)
+        free = or_(col(PumpLock.owner).is_(None), col(PumpLock.expires) < now)
+        if self._unreleased:
+            # This instance's own leases, left behind by a release or takeover that failed.
+            free = or_(free, col(PumpLock.owner).in_(self._unreleased))
         takeover = (
             update(PumpLock)
             .where(col(PumpLock.pump) == self.title, free)
@@ -124,11 +128,14 @@ class BasePump(ABC):
         # Owned before commit: if the commit is interrupted, run() still releases whatever it may have taken.
         self._lease = owner
         if (await self.session.exec(takeover)).rowcount != 1:
-            self._lease = None
+            # Not even one of the unreleased tokens is in pump_lock, or the update would have matched it.
             await self.session.rollback()
+            self._forget_lease()
             return False
 
         await self.session.commit()
+        # The takeover replaced whichever token was there.
+        self._unreleased.clear()
         return True
 
     async def _ensure_lease_row(self) -> None:
@@ -165,21 +172,26 @@ class BasePump(ABC):
             raise RuntimeError(f"Pump lease lost, another run has taken over: {self.title}")
 
     async def _release_lease(self) -> None:
-        if self._lease is None:
+        if self._lease is None and not self._unreleased:
             return
 
         await self._exec_release()
         await self.session.commit()
-        # Cleared only once committed: an interrupted release is retried by run()'s failure handling.
-        self._lease = None
+        # Forgotten only once committed: an interrupted release is retried by run()'s failure handling.
+        self._forget_lease()
 
     async def _exec_release(self) -> None:
+        tokens = self._unreleased | ({self._lease} if self._lease is not None else set())
         query = (
             update(PumpLock)
-            .where(col(PumpLock.pump) == self.title, col(PumpLock.owner) == self._lease)
+            .where(col(PumpLock.pump) == self.title, col(PumpLock.owner).in_(tokens))
             .values(owner=None, expires=None)
         )
         await self.session.exec(query)
+
+    def _forget_lease(self) -> None:
+        self._lease = None
+        self._unreleased.clear()
 
     async def _new_meta(self) -> PumpMeta | None:
         started = datetime.now(UTC)
@@ -214,6 +226,8 @@ class BasePump(ABC):
             modified_since = last.started
             created_after = modified_since - self.past_interval
 
+        # Source I/O can be slow: never wait on it inside the transaction the metadata queries opened.
+        await self.session.commit()
         generator = self._fetch(modified_since=modified_since, created_after=created_after)
         async for batch in abatched(generator, self.batch_size):
             # One fenced transaction per batch: a run that has lost its lease cannot commit a stale batch.
@@ -233,7 +247,7 @@ class BasePump(ABC):
         self.session.add(meta)
         await self._exec_release()
         await self.session.commit()
-        self._lease = None
+        self._forget_lease()
         await self.session.refresh(meta)
         # End the refresh's transaction too, so the session does not idle inside one until the next run;
         # expunged first, meta keeps its loaded attributes whatever expire_on_commit is.

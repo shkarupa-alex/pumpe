@@ -460,8 +460,9 @@ async def test_cancel_during_final_commit_does_not_orphan_lease(tmp_path: Path) 
         assert after.mode == PumpMode.FULL
 
 
-def fail_lease_release_once(session: AsyncSession) -> None:
-    failed: list[str] = []
+def fail_lease_updates(session: AsyncSession, *kinds: str) -> None:
+    """Fail the given lease updates ("take" or "release"), in this order, once each."""
+    pending = list(kinds)
 
     def hook(  # noqa: PLR0913, PLR0917
         conn: object,  # noqa: ARG001
@@ -471,11 +472,13 @@ def fail_lease_release_once(session: AsyncSession) -> None:
         context: object,  # noqa: ARG001
         executemany: bool,  # noqa: ARG001, FBT001
     ) -> None:
-        # The release clears the owner; taking the lease runs the same statement with a token.
-        releasing = isinstance(parameters, tuple) and parameters[:1] == (None,)
-        if not failed and statement.startswith("UPDATE pump_lock SET owner=?, expires=? WHERE") and releasing:
-            failed.append(statement)
-            raise OperationalError(statement, None, Exception("injected failure"))
+        if not pending or not statement.startswith("UPDATE pump_lock SET owner=?, expires=? WHERE"):
+            return
+        # Taking the lease sets a token as the owner, releasing it clears the owner.
+        kind = "release" if isinstance(parameters, tuple) and parameters[:1] == (None,) else "take"
+        if kind == pending[0]:
+            pending.pop(0)
+            raise OperationalError(statement, None, Exception(f"injected {kind} failure"))
 
     assert session.bind is not None
     event.listen(session.bind.sync_engine, "before_cursor_execute", hook)
@@ -485,7 +488,7 @@ def fail_lease_release_once(session: AsyncSession) -> None:
 @pytest.mark.parametrize("source_fails", [False, True])
 async def test_failed_release_keeps_pump_usable(*, source_fails: bool) -> None:
     async with memory_session() as session:
-        fail_lease_release_once(session)
+        fail_lease_updates(session, "release")
 
         first = scripted_pump(session, ValueError("source") if source_fails else ROW_1)
         with pytest.raises(ValueError if source_fails else OperationalError):
@@ -631,3 +634,51 @@ async def test_non_json_extras_are_stored(value: object, stored: str) -> None:
         second = await pump.run()
         assert second is not None
         assert (second.skipped, second.updated) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_failed_takeover_keeps_the_unreleased_lease_reclaimable() -> None:
+    async with memory_session() as session:
+        # Both release attempts of the first run fail, then the second run's takeover fails.
+        fail_lease_updates(session, "release", "release", "take")
+        pump = scripted_pump(session, ROW_1)
+
+        with pytest.raises(OperationalError, match="release"):
+            await pump.run()
+        assert await lease_owner(session) is not None
+
+        with pytest.raises(OperationalError, match="take"):
+            await pump.run()
+
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.mode == PumpMode.FULL
+        assert meta.skipped == 1
+        assert await lease_owner(session) is None
+
+
+class TransactionProbePump(RecordModelPump):
+    in_transaction: list[bool]
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for record in self.records:
+            self.in_transaction.append(self.session.in_transaction())
+            yield record
+        self.in_transaction.append(self.session.in_transaction())
+
+
+@pytest.mark.asyncio
+async def test_model_pump_fetches_outside_a_transaction() -> None:
+    async with memory_session() as session:
+        pump = TransactionProbePump(session, timedelta(0), timedelta(0), timedelta(0), batch_size=2)
+        pump.records = tuple({"id": i, "value": i} for i in range(3))
+        pump.in_transaction = []
+
+        meta = await pump.run()
+        assert meta is not None
+        assert meta.created == 3
+        assert pump.in_transaction == [False] * 4

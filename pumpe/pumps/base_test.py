@@ -176,3 +176,34 @@ async def test_base_pump_keeps_lease_between_batches(tmp_path: Path) -> None:
         assert meta is not None
         assert meta.mode == PumpMode.FULL
         assert meta.skipped == 8
+
+
+class TransactionProbeTaskPump(BasePump):
+    in_transaction: list[bool]
+
+    async def _fetch(
+        self,
+        modified_since: datetime | None,  # noqa: ARG002
+        created_after: datetime | None,  # noqa: ARG002
+    ) -> AsyncGenerator[dict[str, Any]]:
+        for i in range(3):
+            self.in_transaction.append(self.session.in_transaction())
+            yield {"i": i}
+        self.in_transaction.append(self.session.in_transaction())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expire_on_commit", [True, False])
+async def test_fetch_starts_outside_a_transaction(*, expire_on_commit: bool) -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=expire_on_commit) as session:
+        pump = TransactionProbeTaskPump(session, timedelta(hours=1), timedelta(0), timedelta(0), batch_size=2)
+        for mode in (PumpMode.FULL, PumpMode.PARTIAL):
+            pump.in_transaction = []
+            meta = await pump.run()
+            assert meta is not None
+            assert meta.mode == mode
+            assert pump.in_transaction == [False] * 4
+    await engine.dispose()
