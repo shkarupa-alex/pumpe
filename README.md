@@ -20,7 +20,8 @@ Every write transaction renews the lease, and a run that loses it fails before w
 A lease older than `lease_timeout` (a class attribute, 10 minutes by default) is taken over, so keep it above
 the longest time a run spends between two renewals: waiting for the next batch of `_fetch` plus writing a batch.
 A competing run that finds the lease expired while its holder is still writing waits for the database's lock
-timeout, then skips.
+timeout, then skips on PostgreSQL and MySQL/MariaDB. SQLite locks the whole database for a write, so there it cannot
+tell that holder from any other writer and raises `database is locked` instead.
 
 ## Running
 

@@ -176,12 +176,13 @@ class BasePump(ABC):
         try:
             taken = (await self.session.exec(takeover)).rowcount == 1
         except DBAPIError as e:
-            # Only another run's token is evidence that the lock belongs to its holder: SQLite locks the whole
-            # database, so a free or own lease can also be blocked by unrelated writes, which must not look like a skip.
-            if not lock_contended(e) or holder is None or holder in self._unreleased:
+            # A lock on the lease row proves a holder only where locks are per row and the row carries another run's
+            # token; SQLite locks the whole database, so there any unrelated writer looks the same.
+            foreign = holder is not None and holder not in self._unreleased
+            if not (self._locks_rows and foreign and lock_contended(e)):
                 raise
             # The lease looked expired, but its holder has renewed it inside a write transaction that is still open,
-            # and the engine gave up waiting on its lock (SQLite busy timeout, InnoDB lock wait timeout): it is held.
+            # and the engine gave up waiting on its row lock (InnoDB lock wait timeout, PostgreSQL lock_timeout).
             await self.session.rollback()
             # Only a holder that overran lease_timeout gets here; a warning keeps a stuck one visible.
             self.logger.warning("Skip pumping, the expired lease is still locked by its holder: %s", self.title)
@@ -200,6 +201,11 @@ class BasePump(ABC):
         # The takeover replaced whichever token was there.
         self._unreleased.clear()
         return True
+
+    @property
+    def _locks_rows(self) -> bool:
+        """Whether the database locks single rows, so a wait on the lease row means another transaction holds it."""
+        return self.session.get_bind().dialect.name != "sqlite"
 
     async def _ensure_lease_row(self) -> None:
         query = select(PumpLock.pump).where(PumpLock.pump == self.title)

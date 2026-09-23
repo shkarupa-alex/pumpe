@@ -870,7 +870,7 @@ class WritingHoldPump(ScriptedRecordPump):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [False, True])
-async def test_competing_run_skips_while_holder_is_writing(
+async def test_competing_run_while_holder_is_writing(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     *,
@@ -895,7 +895,12 @@ async def test_competing_run_skips_while_holder_is_writing(
 
             started = anyio.current_time()
             try:
-                assert await scripted_pump(session_b, ROW_1).run() is None
+                if expired:
+                    # SQLite cannot tell the holder's lock from any other writer's, so the wait is reported.
+                    with pytest.raises(OperationalError, match="database is locked"):
+                        await scripted_pump(session_b, ROW_1).run()
+                else:
+                    assert await scripted_pump(session_b, ROW_1).run() is None
             finally:
                 holder.gate.opened.set()
             if not expired:
@@ -912,9 +917,12 @@ async def test_competing_run_skips_while_holder_is_writing(
 
 
 @pytest.mark.asyncio
-async def test_unrelated_sqlite_writer_does_not_silently_skip_due_run(tmp_path: Path) -> None:
+@pytest.mark.parametrize("owner", [None, "crashed"])
+async def test_unrelated_sqlite_writer_does_not_silently_skip_due_run(tmp_path: Path, owner: str | None) -> None:
     async with file_sessions(tmp_path, busy_timeout=0.2) as (session_a, session_b):
-        session_a.add(PumpLock(pump=RecordModel.__name__))
+        # A free lease, or one abandoned by a run that died long ago.
+        expires = None if owner is None else datetime.now(UTC) - timedelta(hours=1)
+        session_a.add(PumpLock(pump=RecordModel.__name__, owner=owner, expires=expires))
         await session_a.commit()
 
         # A write to another table holds SQLite's database lock, not the free lease.
@@ -927,7 +935,7 @@ async def test_unrelated_sqlite_writer_does_not_silently_skip_due_run(tmp_path: 
         await session_a.rollback()
 
         assert (await session_b.exec(select(PumpMeta))).all() == []
-        assert await lease_owner(session_b) is None
+        assert await lease_owner(session_b) == owner
 
         meta = await pump.run()
         assert meta is not None

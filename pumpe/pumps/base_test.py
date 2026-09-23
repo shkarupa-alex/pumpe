@@ -275,12 +275,19 @@ def fail_takeover(session: AsyncSession, error: DBAPIError) -> None:
     event.listen(session.bind.sync_engine, "before_cursor_execute", hook)
 
 
+@pytest.fixture
+def row_locks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let an in-memory SQLite session stand for a database that locks single rows."""
+    monkeypatch.setattr(BasePump, "_locks_rows", property(lambda _: True))
+
+
 async def expired_foreign_lease(session: AsyncSession) -> None:
     session.add(PumpLock(pump=RecordModel.__name__, owner="other", expires=datetime.now(UTC) - timedelta(hours=1)))
     await session.commit()
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("row_locks")
 @pytest.mark.parametrize(("error", "orig"), LOCK_ERRORS)
 async def test_contended_takeover_skips(
     error: type[DBAPIError],
@@ -303,8 +310,21 @@ async def test_contended_takeover_skips(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("row_locks")
 @pytest.mark.parametrize(("error", "orig"), OTHER_ERRORS)
 async def test_failed_takeover_raises(error: type[DBAPIError], orig: Exception) -> None:
+    async with memory_session() as session:
+        await expired_foreign_lease(session)
+        fail_takeover(session, error("UPDATE pump_lock", None, orig))
+
+        with pytest.raises(error):
+            await scripted_pump(session, ROW_1).run()
+        assert await lease_owner(session) == "other"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("error", "orig"), LOCK_ERRORS)
+async def test_contended_takeover_raises_on_sqlite(error: type[DBAPIError], orig: Exception) -> None:
     async with memory_session() as session:
         await expired_foreign_lease(session)
         fail_takeover(session, error("UPDATE pump_lock", None, orig))
